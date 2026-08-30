@@ -3341,6 +3341,7 @@ def test_distributed_weight_update_routes_forward_to_client() -> None:
                 "abort_all_requests": False,
                 "weight_version": "v2",
                 "torch_empty_cache": False,
+                "keep_pause": False,
             },
             None,
             0,

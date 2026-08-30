@@ -639,6 +639,7 @@ class UpdateWeightsFromDistributedRequest(AdminRequestBase):
     weight_version: str | None = None
     load_format: str | None = None
     torch_empty_cache: bool = False
+    keep_pause: bool = False
 
 
 class InitWeightsUpdateGroupRequest(AdminRequestBase):

@@ -23,6 +23,9 @@ from sglang_omni.models.moss_tts.request_builders import (
     resolve_moss_reference,
 )
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.rollout_trace import (
+    build_moss_tts_local_rollout_trace,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.prepared_request_queue import PreparedRequestQueue
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -64,6 +67,11 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     stream_metadata: dict[str, Any] | None = None
     stream_pending_rows: list[torch.Tensor] = field(default_factory=list)
     stream_first_batch_sent: bool = False
+    return_omni_rollout: bool = False
+    admission_weight_version: str | None = None
+    output_decisions: list[int] = field(default_factory=list)
+    output_decision_logprobs: list[torch.Tensor] = field(default_factory=list)
+    output_code_logprobs: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -152,6 +160,8 @@ def build_moss_tts_local_state(payload: StagePayload) -> MossTTSLocalState:
         instructions=instructions,
         token_count=token_count,
         generation_kwargs=build_generation_kwargs(params, tts_params=tts_params),
+        return_logprob=bool(params.get("return_logprob", False)),
+        return_omni_rollout=bool(params.get("return_omni_rollout", False)),
     )
 
 
@@ -349,6 +359,46 @@ def build_sglang_moss_tts_local_request(
 
     cfg = model.config
     gen_kwargs = prepared.gen_kwargs
+    if prepared.state.return_omni_rollout:
+        neutral = {
+            "text_top_p": 1.0,
+            "audio_top_p": 1.0,
+            "text_top_k": -1,
+            "audio_top_k": -1,
+            "audio_repetition_penalty": 1.0,
+        }
+        mismatches = {
+            name: (gen_kwargs.get(name), expected)
+            for name, expected in neutral.items()
+            if gen_kwargs.get(name) != expected
+        }
+        if mismatches:
+            raise ValueError(
+                "MOSS-TTS Local structured rollout currently requires neutral sampling; "
+                f"got {mismatches}."
+            )
+        if (
+            float(gen_kwargs.get("text_temperature", 0.0)) <= 0
+            or float(gen_kwargs.get("audio_temperature", 0.0)) <= 0
+        ):
+            raise ValueError(
+                "MOSS-TTS Local structured rollout requires positive text/audio temperatures."
+            )
+        if not prepared.state.return_logprob:
+            raise ValueError(
+                "return_omni_rollout=true requires return_logprob=true for MOSS-TTS Local."
+            )
+
+    try:
+        from sglang.srt.runtime_context import get_serving
+
+        admission_weight_version = str(get_serving().weight_version)
+    except Exception:
+        admission_weight_version = None
+    if prepared.state.return_omni_rollout and admission_weight_version is None:
+        raise RuntimeError(
+            "MOSS-TTS Local structured rollout could not capture the admission weight version"
+        )
     max_new_tokens = int(
         gen_kwargs.get("max_new_tokens", MOSS_TTS_DEFAULT_MAX_NEW_TOKENS)
     )
@@ -399,6 +449,9 @@ def build_sglang_moss_tts_local_request(
         stream_metadata=build_moss_tts_local_stream_metadata(
             payload, n_vq=int(prepared.prompt_rows.shape[1]) - 1
         ),
+        return_logprob=bool(prepared.state.return_logprob),
+        return_omni_rollout=bool(prepared.state.return_omni_rollout),
+        admission_weight_version=admission_weight_version,
     )
     data.input_embeds_are_projected = True
     data.stage_payload = payload
@@ -424,6 +477,54 @@ def apply_sglang_moss_tts_local_result(
     state.prompt_tokens = len(data.input_ids) if data.input_ids is not None else 0
     state.completion_tokens = len(data.output_rows)
     state.engine_time_s = time.perf_counter() - data.engine_start_s
+    state.finish_reason = data.finish_reason
+    state.weight_version = data.weight_version
+    if data.return_omni_rollout:
+        if data.prompt_rows is None:
+            raise ValueError(
+                "MOSS-TTS Local structured rollout is missing exact prompt_rows."
+            )
+        if data.admission_weight_version is None or data.weight_version is None:
+            raise ValueError(
+                "MOSS-TTS Local structured rollout is missing admission/response weight version."
+            )
+        if str(data.admission_weight_version) != str(data.weight_version):
+            raise ValueError(
+                "MOSS-TTS Local request crossed a weight update: "
+                f"admission={data.admission_weight_version!r}, response={data.weight_version!r}."
+            )
+        decisions = torch.tensor(data.output_decisions, dtype=torch.long)
+        decision_logprobs = (
+            torch.stack(data.output_decision_logprobs).to(torch.float32).reshape(-1)
+            if data.output_decision_logprobs
+            else torch.empty(0, dtype=torch.float32)
+        )
+        code_logprobs = (
+            torch.stack(data.output_code_logprobs).to(torch.float32).reshape(-1, n_vq)
+            if data.output_code_logprobs
+            else torch.empty((0, n_vq), dtype=torch.float32)
+        )
+        state.omni_rollout = build_moss_tts_local_rollout_trace(
+            prompt_rows=data.prompt_rows,
+            decisions=decisions,
+            decision_logprobs=decision_logprobs,
+            codes=state.audio_codes,
+            code_logprobs=code_logprobs,
+            finish_reason=str(data.finish_reason),
+            admission_weight_version=str(data.admission_weight_version),
+            request_id=str(payload.request_id),
+            sampling={
+                "text_temperature": float(data.text_temperature),
+                "text_top_p": float(data.text_top_p),
+                "text_top_k": int(data.text_top_k),
+                "audio_temperature": float(data.audio_temperature),
+                "audio_top_p": float(data.audio_top_p),
+                "audio_top_k": int(data.audio_top_k),
+                "audio_repetition_penalty": float(data.audio_repetition_penalty),
+                "seed": data.seed,
+            },
+            model_config=data.model_config,
+        )
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,

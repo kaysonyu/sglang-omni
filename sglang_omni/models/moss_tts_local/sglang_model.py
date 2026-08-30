@@ -616,6 +616,72 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 )
         return stop_choice, torch.stack(codes, dim=-1)
 
+    @torch.no_grad()
+    def decode_frame_with_logprobs(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        sample_text: Callable[[torch.Tensor], torch.Tensor],
+        sample_audio: Callable[[torch.Tensor, int], torch.Tensor],
+        text_temperature: torch.Tensor,
+        audio_temperature: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Eager RL path returning selected full-vocabulary behavior logprobs.
+
+        The request builder restricts this path to positive-temperature,
+        unfiltered sampling.  If top-p/top-k/repetition filters are enabled in
+        the future, this method must gather from the sampler's filtered and
+        renormalized distribution instead.
+        """
+
+        from sglang_omni.models.moss_tts_local.rollout_trace import (
+            selected_action_logprobs,
+        )
+
+        local_hidden = self.local_transformer.step(
+            hidden_states.to(dtype=self.dtype), 0
+        )
+        text_logits = F.linear(local_hidden, self.local_text_lm_head.weight).float()
+        stop_choice = sample_text(text_logits)
+        decision_logprobs = selected_action_logprobs(
+            text_logits, stop_choice, text_temperature
+        )
+
+        codes = []
+        code_logprobs = []
+        current = local_hidden
+        for channel in range(self.n_vq):
+            head_weight = self._audio_embedding_weight(channel)
+            logits = F.linear(current, head_weight).float()
+            code = sample_audio(logits, channel)
+            selected = selected_action_logprobs(logits, code, audio_temperature)
+            codes.append(code)
+            code_logprobs.append(selected)
+            if channel + 1 < self.n_vq:
+                next_embed = F.embedding(code, head_weight)
+                current = self.local_transformer.step(
+                    next_embed.to(dtype=self.dtype), channel + 1
+                )
+        return (
+            stop_choice,
+            torch.stack(codes, dim=-1),
+            decision_logprobs.to(torch.float32),
+            torch.stack(code_logprobs, dim=-1).to(torch.float32),
+        )
+
+    def rollout_model_info(self) -> dict[str, Any]:
+        from sglang_omni.models.moss_tts_local.rollout_trace import (
+            MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,
+            MOSS_TTS_LOCAL_ROLLOUT_VERSION,
+            moss_tts_local_model_identity,
+        )
+
+        return {
+            "model_identity": moss_tts_local_model_identity(self.config),
+            "rollout_schema_versions": [MOSS_TTS_LOCAL_ROLLOUT_VERSION],
+            "logprob_semantics": MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,
+        }
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
