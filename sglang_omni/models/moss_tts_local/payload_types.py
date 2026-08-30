@@ -44,4 +44,9 @@ class MossTTSLocalState(DeclarativeStateBase):
     instructions: str | None = None
     token_count: int | None = wire(None, codec="opt_int")
     generation_kwargs: dict[str, Any] = wire(default_factory=dict, codec="dict")
+    return_logprob: bool = wire(False, emit="truthy", codec="bool")
+    return_omni_rollout: bool = wire(False, emit="truthy", codec="bool")
+    omni_rollout: dict[str, Any] | None = None
+    finish_reason: str | None = None
+    weight_version: str | None = None
     audio_codes: Any | None = wire(None, codec="tensor_cpu")

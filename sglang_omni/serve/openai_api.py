@@ -114,7 +114,9 @@ from sglang_omni.serve.speech_limits import (
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 from sglang_omni.serve.speech_voices import SpeakerSampleStore
 from sglang_omni.serve.speech_ws import SpeechWebSocketSession
-from sglang_omni.serve.streaming import STREAM_DONE_SENTINEL
+from sglang_omni.serve.streaming import (
+    STREAM_DONE_SENTINEL,
+)
 from sglang_omni.serve.streaming import (
     ClosableStreamingResponse as _ClosableStreamingResponse,
 )
@@ -1169,7 +1171,11 @@ def _build_generate_response(
         )
     audio: GenerateAudio | None = None
     if result.audio is not None:
-        audio = GenerateAudio(data=result.audio.data, format=audio_format)
+        audio = GenerateAudio(
+            data=result.audio.data,
+            format=audio_format,
+            sample_rate=result.audio.sample_rate,
+        )
 
     meta_info = GenerateMetaInfo(
         finish_reason=finish_reason,
