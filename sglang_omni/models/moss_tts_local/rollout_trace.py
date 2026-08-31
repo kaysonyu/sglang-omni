@@ -42,6 +42,11 @@ def moss_tts_local_model_identity(config: Any) -> dict[str, Any]:
         or getattr(config, "qwen3_config", None)
         or config
     )
+    local = (
+        getattr(config, "gpt2_config", None)
+        or getattr(config, "local_config", None)
+        or config
+    )
     identity = {
         "policy_family": "moss_tts_local_v1_5",
         "architecture": "MossTTSLocalModel",
@@ -56,6 +61,10 @@ def moss_tts_local_model_identity(config: Any) -> dict[str, Any]:
         "hidden_size": int(getattr(config, "hidden_size", language.hidden_size)),
         "global_layers": int(getattr(language, "num_hidden_layers", 0)),
         "local_layers": int(getattr(config, "local_transformer_layers", 1)),
+        "local_num_attention_heads": int(getattr(local, "n_head")),
+        "local_ffn_hidden_size": int(getattr(local, "n_inner")),
+        "local_rope_base": float(getattr(local, "rope_base")),
+        "local_layer_norm_epsilon": float(getattr(local, "layer_norm_epsilon")),
         "tie_audio_embeddings": True,
         "sample_rate": 48000,
     }
