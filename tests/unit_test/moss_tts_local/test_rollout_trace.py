@@ -18,6 +18,12 @@ def _config():
     language = SimpleNamespace(
         vocab_size=151936, hidden_size=2560, num_hidden_layers=36
     )
+    local = SimpleNamespace(
+        n_head=32,
+        n_inner=9728,
+        rope_base=1_000_000.0,
+        layer_norm_epsilon=1e-6,
+    )
     return SimpleNamespace(
         n_vq=12,
         audio_vocab_size=1024,
@@ -28,6 +34,7 @@ def _config():
         hidden_size=2560,
         local_transformer_layers=1,
         language_config=language,
+        gpt2_config=local,
     )
 
 
@@ -87,6 +94,10 @@ def test_model_identity_contains_trainer_handshake_fields():
     assert identity["audio_end_token_id"] == 151670
     assert identity["global_layers"] == 36
     assert identity["local_layers"] == 1
+    assert identity["local_num_attention_heads"] == 32
+    assert identity["local_ffn_hidden_size"] == 9728
+    assert identity["local_rope_base"] == 1_000_000.0
+    assert identity["local_layer_norm_epsilon"] == 1e-6
     assert identity["tie_audio_embeddings"] is True
 
 
