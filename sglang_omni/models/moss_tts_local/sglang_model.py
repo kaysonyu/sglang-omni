@@ -39,6 +39,7 @@ from sglang_omni.models.moss_tts_local.local_transformer import MossTTSLocalTran
 from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
+from sglang_omni.models.moss_tts_local.rollout_trace import selected_action_logprobs
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeStatePool
 
 logger = logging.getLogger(__name__)
@@ -416,7 +417,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         audio_top_k: torch.Tensor,
         seeds: torch.Tensor,
         base_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Branchless frame decode used both eagerly and under graph capture.
 
         ``base_positions`` is ``generation_steps * (n_vq + 1)``; channel
@@ -425,11 +432,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         Repetition penalty is not supported here (the runner falls back to
         the eager path when a request enables it).
 
-        Returns ``(stop_choice, codes, feedback_embeds)`` where
+        Returns ``(stop_choice, codes, feedback_embeds, decision_logprobs,
+        code_logprobs)`` where
         ``feedback_embeds`` is the next backbone input embedding for a
         continuing row — the assistant-slot text embedding plus all 12 code
         embeddings, summed in the same channel order as
-        ``_prepare_multi_modal_inputs``.
+        ``_prepare_multi_modal_inputs``.  The selected-action logprobs are
+        captured in the same graph so structured RL rollouts do not have to
+        fall back to the roughly 500-launch eager frame decoder.
         """
         local_hidden = self.local_transformer.step(
             hidden_states.to(dtype=self.dtype), 0
@@ -443,12 +453,16 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             seeds=seeds,
             positions=base_positions,
         )
+        decision_logprobs = selected_action_logprobs(
+            text_logits, stop_choice, text_temperature
+        )
 
         slot_ids = torch.full_like(
             seeds, int(self.config.audio_assistant_slot_token_id)
         )
         feedback = self.embedding_list[0](slot_ids)
         codes = []
+        code_logprobs = []
         current = local_hidden
         for channel in range(self.n_vq):
             head_weight = self._audio_embedding_weight(channel)
@@ -462,13 +476,22 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 positions=base_positions + channel + 1,
             )
             codes.append(code)
+            code_logprobs.append(
+                selected_action_logprobs(logits, code, audio_temperature)
+            )
             code_embed = F.embedding(code, head_weight)
             feedback = feedback + code_embed
             if channel + 1 < self.n_vq:
                 current = self.local_transformer.step(
                     code_embed.to(dtype=self.dtype), channel + 1
                 )
-        return stop_choice, torch.stack(codes, dim=-1), feedback
+        return (
+            stop_choice,
+            torch.stack(codes, dim=-1),
+            feedback,
+            decision_logprobs.to(torch.float32),
+            torch.stack(code_logprobs, dim=-1).to(torch.float32),
+        )
 
     @torch.no_grad()
     def init_frame_decode_graphs(self, batch_sizes: list[int]) -> None:
@@ -496,7 +519,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._frame_graphs: dict[
             int,
             tuple[
-                Any, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
+                Any,
+                dict[str, torch.Tensor],
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
             ],
         ] = {}
 
@@ -532,13 +561,21 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                stop_choice, codes, feedback = frame_decode(**static_inputs)
+                (
+                    stop_choice,
+                    codes,
+                    feedback,
+                    decision_logprobs,
+                    code_logprobs,
+                ) = frame_decode(**static_inputs)
             self._frame_graphs[bucket] = (
                 graph,
                 static_inputs,
                 stop_choice,
                 codes,
                 feedback,
+                decision_logprobs,
+                code_logprobs,
             )
         logger.info(
             f"MOSS-TTS Local frame-decode CUDA graphs captured for bs={buckets}"
@@ -562,7 +599,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         audio_top_k: torch.Tensor,
         seeds: torch.Tensor,
         base_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Replay the captured frame decode for this batch (padded up to the
         nearest bucket; padding rows sample garbage that the caller discards).
 
@@ -572,7 +610,15 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         """
         batch_size = hidden_states.shape[0]
         bucket = min(b for b in self._frame_graphs if b >= batch_size)
-        graph, static_inputs, stop_choice, codes, feedback = self._frame_graphs[bucket]
+        (
+            graph,
+            static_inputs,
+            stop_choice,
+            codes,
+            feedback,
+            decision_logprobs,
+            code_logprobs,
+        ) = self._frame_graphs[bucket]
 
         static_inputs["hidden_states"][:batch_size].copy_(
             hidden_states.to(dtype=self.dtype)
@@ -594,6 +640,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             if batch_size < bucket:
                 buf[batch_size:].fill_(1 if buf.dtype.is_floating_point else 1)
         graph.replay()
+        if return_logprobs:
+            return (
+                stop_choice[:batch_size],
+                codes[:batch_size],
+                feedback[:batch_size],
+                decision_logprobs[:batch_size],
+                code_logprobs[:batch_size],
+            )
         return stop_choice[:batch_size], codes[:batch_size], feedback[:batch_size]
 
     @torch.no_grad()
