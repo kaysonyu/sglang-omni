@@ -383,14 +383,13 @@ class MossTTSLocalModelRunner(ModelRunner):
         except AttributeError:
             frame_graph_max_bs = 0
         use_graph = (
-            not capture_rollout_logprobs
-            and not has_audio_repetition_penalty
+            not has_audio_repetition_penalty
             and batch_size <= frame_graph_max_bs
         )
         decision_logprobs = None
         code_logprobs = None
         if use_graph:
-            stop_choice, codes, feedback = self.model.decode_frame_graphed(
+            graph_output = self.model.decode_frame_graphed(
                 hidden_states,
                 text_temperature=text_temp,
                 text_top_p=text_top_p,
@@ -400,11 +399,26 @@ class MossTTSLocalModelRunner(ModelRunner):
                 audio_top_k=audio_top_k,
                 seeds=sampling_seeds,
                 base_positions=gen_steps * num_channels,
+                return_logprobs=capture_rollout_logprobs,
             )
+            if capture_rollout_logprobs:
+                (
+                    stop_choice,
+                    codes,
+                    feedback,
+                    decision_logprobs,
+                    code_logprobs,
+                ) = graph_output
+            else:
+                stop_choice, codes, feedback = graph_output
             # The graph outputs are static buffers that the next replay (any
             # later prefill or decode step) overwrites; snapshot what we keep.
             codes = codes.clone()
             embeds = feedback.clone()
+            if decision_logprobs is not None:
+                decision_logprobs = decision_logprobs.clone()
+            if code_logprobs is not None:
+                code_logprobs = code_logprobs.clone()
         else:
             if capture_rollout_logprobs:
                 stop_choice, codes, decision_logprobs, code_logprobs = (
