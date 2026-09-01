@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MOSS-TTS Local (v1.5) pipeline state."""
+"""mossLite MOSS-TTS Local pipeline state."""
 
 from __future__ import annotations
 
@@ -12,15 +12,10 @@ from sglang_omni.scheduling.pipeline_state import DeclarativeStateBase, wire
 def moss_tts_local_special_token_defaults(
     audio_vocab_size: int = 1024,
 ) -> tuple[tuple[str, int], ...]:
-    """Default special-token ids for MOSS-TTS-Local-Transformer-v1.5.
-
-    These differ from the MOSS Delay family: the Local release introduces
-    dedicated ``<|audio_start|>``/``<|audio_end|>`` tokens and reuses the
-    Qwen vision/video pad ids as the user/assistant audio slot tokens.
-    """
+    """Fixed MossFlux v2 token contract used by mossLite Local training."""
     return (
-        ("audio_start_token_id", 151669),
-        ("audio_end_token_id", 151670),
+        ("audio_start_token_id", 151652),
+        ("audio_end_token_id", 151653),
         ("audio_user_slot_token_id", 151654),
         ("audio_assistant_slot_token_id", 151656),
         ("audio_assistant_gen_slot_token_id", 151656),

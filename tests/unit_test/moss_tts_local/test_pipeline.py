@@ -37,6 +37,7 @@ from sglang_omni.models.moss_tts_local.request_builders import (
     build_moss_tts_local_state,
     clear_moss_tts_local_preprocessing_context,
     preprocess_moss_tts_local_payload,
+    render_moss_tts_v2_generation_prompt,
     set_moss_tts_local_preprocessing_context,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
@@ -1096,10 +1097,11 @@ def test_colocated_moss_ar_factory_accepts_explicit_effective_budget():
         )
 
 
-def test_special_token_defaults_match_v15_checkpoint():
+def test_special_token_defaults_match_mossflux_v2_checkpoint():
     defaults = dict(moss_tts_local_special_token_defaults())
-    assert defaults["audio_start_token_id"] == 151669
-    assert defaults["audio_end_token_id"] == 151670
+    assert defaults["audio_start_token_id"] == 151652
+    assert defaults["audio_start_token_id"] == 151652
+    assert defaults["audio_end_token_id"] == 151653
     assert defaults["audio_user_slot_token_id"] == 151654
     assert defaults["audio_assistant_slot_token_id"] == 151656
     assert defaults["audio_pad_code"] == 1024
@@ -1153,6 +1155,34 @@ def test_build_state_token_count_and_language():
     assert build_moss_tts_local_state(payload).language is None
 
 
+def test_moss_tts_v2_prompt_matches_renderer_revision_three():
+    assert (
+        render_moss_tts_v2_generation_prompt(
+            script="Read this line.",
+            reference_count=1,
+            global_instruction="Keep the room tone.",
+            global_tokens=120,
+        )
+        == "paradigm: generate\n\n"
+        "audio1: <|audio|>\n\n"
+        "script: Read this line.\n\n"
+        "global instruction: Keep the room tone.\n\n"
+        "global tokens: 120"
+    )
+    assert (
+        render_moss_tts_v2_generation_prompt(
+            script="No reference.",
+            reference_count=0,
+            global_instruction=None,
+            global_tokens=None,
+        )
+        == "paradigm: generate\n\n"
+        "script: No reference.\n\n"
+        "global instruction: None\n\n"
+        "global tokens: None"
+    )
+
+
 # Preprocessing handoff + result adapter
 
 
@@ -1168,11 +1198,11 @@ class _FakeProcessor:
     def __call__(self, conversations, mode):
         assert mode == "generation"
         message = conversations[0][0]
-        text = str(message.get("text", ""))
+        text = str(message.get("content", ""))
         seq = max(4, len(text) % 7 + 4)
         rows = torch.full((1, seq, N_VQ + 1), 1024, dtype=torch.long)
         rows[0, :, 0] = torch.arange(seq)
-        rows[0, -1, 0] = 151669  # trailing audio_start row
+        rows[0, -1, 0] = 151652  # trailing MossFlux v2 audio_start row
         return {"input_ids": rows}
 
 
@@ -1642,7 +1672,7 @@ def test_cached_reference_encoder_on_off_hit_bit_identical(tmp_path):
         def __call__(self, conversations, mode):
             assert mode == "generation"
             msg = conversations[0][0]
-            ref = msg.get("reference") or []
+            ref = msg.get("audio_codes_list") or []
             ref_val = (
                 int(ref[0].sum().item()) % 1024
                 if ref and isinstance(ref[0], torch.Tensor)
@@ -1651,7 +1681,7 @@ def test_cached_reference_encoder_on_off_hit_bit_identical(tmp_path):
             seq = 8
             rows = torch.full((1, seq, N_VQ + 1), ref_val, dtype=torch.long)
             rows[0, :, 0] = torch.arange(seq)
-            rows[0, -1, 0] = 151669
+            rows[0, -1, 0] = 151652
             return {"input_ids": rows}
 
     def _ref_payload(rid: str) -> StagePayload:
@@ -1882,8 +1912,9 @@ def test_uncached_data_uri_uses_reference_encoder():
 
     assert len(model.calls) == 1
     assert model.calls[0][1] == N_VQ
-    assert len(message["reference"]) == 1
-    assert message["reference"][0].shape[1] == N_VQ
+    assert len(message["audio_codes_list"]) == 1
+    assert message["audio_codes_list"][0].shape[1] == N_VQ
+    assert message["content"].startswith("paradigm: generate\n\naudio1: <|audio|>")
 
 
 def test_cached_reference_encoder_file_bytes_keyspaces_do_not_collide(tmp_path):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang-native MOSS-TTS Local (v1.5) model wrapper.
+"""SGLang-native mossLite MOSS-TTS Local model wrapper.
 
 Architecture: a 36-layer Qwen3 global backbone consumes one summed embedding
 per audio frame (text channel + 12 RVQ code channels); a 1-layer frame-local
@@ -102,19 +102,68 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        gpt2_cfg = self.config.gpt2_config
+        local_cfg = (
+            getattr(self.config, "gpt2_config", None)
+            or getattr(self.config, "gpt_neox_config", None)
+            or getattr(self.config, "local_config", None)
+        )
+        if local_cfg is None:
+            raise ValueError(
+                "MOSS-TTS Local config is missing its local decoder config."
+            )
+        rope_parameters = self._cfg_get(local_cfg, "rope_parameters", {})
+        local_rope_base = self._cfg_get(local_cfg, "rope_base", None)
+        if local_rope_base is None:
+            local_rope_base = self._cfg_get(rope_parameters, "rope_theta", 1_000_000.0)
         self.local_transformer = MossTTSLocalTransformer(
             hidden_size=self.hidden_size,
-            num_heads=int(self._cfg_get(gpt2_cfg, "n_head", 32)),
-            inner_size=int(self._cfg_get(gpt2_cfg, "n_inner", 4 * self.hidden_size)),
-            num_layers=int(getattr(self.config, "local_transformer_layers", 1)),
+            num_heads=int(
+                self._cfg_get(
+                    local_cfg,
+                    "n_head",
+                    self._cfg_get(local_cfg, "num_attention_heads", 32),
+                )
+            ),
+            inner_size=int(
+                self._cfg_get(
+                    local_cfg,
+                    "n_inner",
+                    self._cfg_get(local_cfg, "intermediate_size", 4 * self.hidden_size),
+                )
+            ),
+            num_layers=int(
+                getattr(self.config, "local_transformer_layers", None)
+                or self._cfg_get(
+                    local_cfg,
+                    "n_layer",
+                    self._cfg_get(local_cfg, "num_hidden_layers", 1),
+                )
+            ),
             max_positions=self.n_vq + 1,
-            rope_base=float(self._cfg_get(gpt2_cfg, "rope_base", 1_000_000.0)),
-            layer_norm_eps=float(self._cfg_get(gpt2_cfg, "layer_norm_epsilon", 1e-6)),
+            rope_base=float(local_rope_base),
+            layer_norm_eps=float(
+                self._cfg_get(
+                    local_cfg,
+                    "layer_norm_epsilon",
+                    self._cfg_get(local_cfg, "layer_norm_eps", 1e-6),
+                )
+            ),
         )
         # Binary continue/stop head over the local position-0 hidden state:
         # index 0 -> audio_assistant_slot (emit a frame), 1 -> audio_end (stop).
         self.local_text_lm_head = torch.nn.Linear(self.hidden_size, 2, bias=False)
+        self.audio_lm_heads = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(
+                    self.hidden_size,
+                    int(self.config.audio_vocab_size),
+                    bias=False,
+                    device=self.local_text_lm_head.weight.device,
+                    dtype=self.local_text_lm_head.weight.dtype,
+                )
+                for _ in range(self.n_vq)
+            ]
+        )
 
         max_batch_size = None
         try:
@@ -186,8 +235,22 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         config.n_vq = int(getattr(config, "n_vq", 12))
         config.channels = int(getattr(config, "channels", config.n_vq + 1))
-        audio_vocab_size = int(getattr(config, "audio_vocab_size", 1024) or 1024)
+        codebook_sizes = getattr(config, "audio_codebook_sizes", None)
+        audio_vocab_size = int(
+            getattr(config, "audio_vocab_size", None)
+            or (max(codebook_sizes) if codebook_sizes else 1024)
+        )
         config.audio_vocab_size = audio_vocab_size
+        tie_audio = getattr(
+            config,
+            "tie_audio_embeddings_and_output_weights",
+            getattr(config, "tie_audio_embeddings", None),
+        )
+        if tie_audio is not False:
+            raise ValueError(
+                "mossLite MOSS-TTS Local requires independent audio embeddings "
+                "and output heads."
+            )
         if not getattr(config, "vocab_size_list", None):
             config.vocab_size_list = [config.vocab_size] + [audio_vocab_size + 1] * (
                 config.channels - 1
@@ -195,6 +258,10 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         for attr, default in moss_tts_local_special_token_defaults(audio_vocab_size):
             if getattr(config, attr, None) is None:
                 setattr(config, attr, default)
+        if getattr(config, "audio_assistant_slot_token_id", None) is None:
+            config.audio_assistant_slot_token_id = int(
+                config.audio_assistant_gen_slot_token_id
+            )
         if not getattr(config, "pad_token", None):
             text_pad = int(getattr(config, "pad_token_id", 0) or 0)
             audio_pad = int(config.audio_pad_code)
@@ -231,6 +298,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         """Rows 0..audio_vocab_size-1 of codebook ``channel``'s table."""
         weight = self.embedding_list[channel + 1].weight
         return weight[: int(self.config.audio_vocab_size)]
+
+    def _audio_head_weight(self, channel: int) -> torch.Tensor:
+        """Independent RVQ output projection for one local depth."""
+
+        return self.audio_lm_heads[channel].weight
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._prepare_multi_modal_inputs(input_ids)
@@ -465,7 +537,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         code_logprobs = []
         current = local_hidden
         for channel in range(self.n_vq):
-            head_weight = self._audio_embedding_weight(channel)
+            head_weight = self._audio_head_weight(channel)
             logits = F.linear(current, head_weight).float()
             code = self._sample_seeded_branchless(
                 logits,
@@ -479,7 +551,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             code_logprobs.append(
                 selected_action_logprobs(logits, code, audio_temperature)
             )
-            code_embed = F.embedding(code, head_weight)
+            code_embed = F.embedding(code, self._audio_embedding_weight(channel))
             feedback = feedback + code_embed
             if channel + 1 < self.n_vq:
                 current = self.local_transformer.step(
@@ -682,12 +754,12 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         codes = []
         current = local_hidden
         for channel in range(self.n_vq):
-            head_weight = self._audio_embedding_weight(channel)
+            head_weight = self._audio_head_weight(channel)
             logits = F.linear(current, head_weight)
             code = sample_audio(logits.float(), channel)
             codes.append(code)
             if channel + 1 < self.n_vq:
-                next_embed = F.embedding(code, head_weight)
+                next_embed = F.embedding(code, self._audio_embedding_weight(channel))
                 current = self.local_transformer.step(
                     next_embed.to(dtype=self.dtype), channel + 1
                 )
@@ -728,14 +800,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         code_logprobs = []
         current = local_hidden
         for channel in range(self.n_vq):
-            head_weight = self._audio_embedding_weight(channel)
+            head_weight = self._audio_head_weight(channel)
             logits = F.linear(current, head_weight).float()
             code = sample_audio(logits, channel)
             selected = selected_action_logprobs(logits, code, audio_temperature)
             codes.append(code)
             code_logprobs.append(selected)
             if channel + 1 < self.n_vq:
-                next_embed = F.embedding(code, head_weight)
+                next_embed = F.embedding(code, self._audio_embedding_weight(channel))
                 current = self.local_transformer.step(
                     next_embed.to(dtype=self.dtype), channel + 1
                 )
@@ -787,10 +859,9 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Tied heads: the checkpoint may carry text_lm_head /
-            # audio_lm_heads tensors that alias embed_tokens /
-            # audio_embeddings; the embedding tables are authoritative here.
-            if name.startswith("text_lm_head.") or name.startswith("audio_lm_heads."):
+            # The compatibility text head is tied and unused by this serving
+            # model. RVQ heads are independent in mossLite and load below.
+            if name.startswith("text_lm_head."):
                 continue
 
             if name.startswith("audio_embeddings.") and name.endswith(".weight"):
@@ -801,10 +872,30 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                     # real rows directly instead of using the vocab loader.
                     param = params_dict[mapped]
                     rows = int(loaded_weight.shape[0])
+                    expected_shape = (
+                        int(self.config.audio_vocab_size),
+                        self.hidden_size,
+                    )
+                    if tuple(loaded_weight.shape) != expected_shape:
+                        raise ValueError(
+                            f"MOSS-TTS Local audio embedding {original_name} has "
+                            f"shape {tuple(loaded_weight.shape)}, expected "
+                            f"{expected_shape}."
+                        )
                     with torch.no_grad():
                         param.data[:rows].copy_(
                             loaded_weight.to(device=param.device, dtype=param.dtype)
                         )
+                continue
+
+            if name.startswith("audio_lm_heads.") and name.endswith(".weight"):
+                param = params_dict.get(name)
+                if param is not None:
+                    self._load_param(param, loaded_weight)
+                else:
+                    logger.warning(
+                        f"MOSS-TTS Local parameter {original_name} not found"
+                    )
                 continue
 
             if name.startswith("local_transformer.") or name.startswith(
@@ -882,7 +973,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         embed_weights = [
             getattr(layer, "weight", None) for layer in self.embedding_list
         ]
-        return embed_weights, [self.local_text_lm_head.weight]
+        head_weights = [
+            self.local_text_lm_head.weight,
+            *(head.weight for head in self.audio_lm_heads),
+        ]
+        return embed_weights, head_weights
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

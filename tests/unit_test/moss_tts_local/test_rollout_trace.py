@@ -16,7 +16,14 @@ from sglang_omni.models.moss_tts_local.rollout_trace import (
 
 def _config():
     language = SimpleNamespace(
-        vocab_size=151936, hidden_size=2560, num_hidden_layers=36
+        vocab_size=151936,
+        hidden_size=2560,
+        num_hidden_layers=36,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        intermediate_size=9728,
+        rope_theta=1_000_000.0,
+        rms_norm_eps=1e-6,
     )
     local = SimpleNamespace(
         n_head=32,
@@ -28,8 +35,11 @@ def _config():
         n_vq=12,
         audio_vocab_size=1024,
         audio_pad_code=1024,
+        audio_start_token_id=151652,
+        audio_user_slot_token_id=151654,
         audio_assistant_slot_token_id=151656,
-        audio_end_token_id=151670,
+        audio_end_token_id=151653,
+        tie_audio_embeddings_and_output_weights=False,
         vocab_size=151936,
         hidden_size=2560,
         local_transformer_layers=1,
@@ -89,16 +99,17 @@ def test_rollout_trace_rejects_discarded_stop_codes():
 def test_model_identity_contains_trainer_handshake_fields():
     identity = moss_tts_local_model_identity(_config())
 
-    assert identity["policy_family"] == "moss_tts_local_v1_5"
+    assert identity["policy_family"] == "moss_tts_local"
     assert identity["n_vq"] == 12
-    assert identity["audio_end_token_id"] == 151670
+    assert identity["audio_end_token_id"] == 151653
     assert identity["global_layers"] == 36
     assert identity["local_layers"] == 1
     assert identity["local_num_attention_heads"] == 32
     assert identity["local_ffn_hidden_size"] == 9728
     assert identity["local_rope_base"] == 1_000_000.0
     assert identity["local_layer_norm_epsilon"] == 1e-6
-    assert identity["tie_audio_embeddings"] is True
+    assert identity["tie_audio_embeddings_and_output_weights"] is False
+    assert identity["embedding_head_storage"] == "split_v1"
 
 
 def test_selected_action_logprobs_match_temperature_scaled_full_vocab():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MOSS-TTS Local structured rollout schema v2."""
+"""mossLite MOSS-TTS Local structured rollout schema v2."""
 
 from __future__ import annotations
 
@@ -44,15 +44,23 @@ def moss_tts_local_model_identity(config: Any) -> dict[str, Any]:
     )
     local = (
         getattr(config, "gpt2_config", None)
+        or getattr(config, "gpt_neox_config", None)
         or getattr(config, "local_config", None)
         or config
     )
+    local_rope_parameters = getattr(local, "rope_parameters", None)
+    if isinstance(local_rope_parameters, dict):
+        local_rope_from_parameters = local_rope_parameters.get("rope_theta")
+    else:
+        local_rope_from_parameters = getattr(local_rope_parameters, "rope_theta", None)
     identity = {
-        "policy_family": "moss_tts_local_v1_5",
-        "architecture": "MossTTSLocalModel",
+        "policy_family": "moss_tts_local",
+        "architecture": "MOSS-TTS-Local",
         "n_vq": int(config.n_vq),
         "audio_vocab_size": int(config.audio_vocab_size),
         "audio_pad_code": int(config.audio_pad_code),
+        "audio_start_token_id": int(config.audio_start_token_id),
+        "audio_user_slot_token_id": int(config.audio_user_slot_token_id),
         "audio_assistant_slot_token_id": int(config.audio_assistant_slot_token_id),
         "audio_end_token_id": int(config.audio_end_token_id),
         "text_vocab_size": int(
@@ -60,13 +68,43 @@ def moss_tts_local_model_identity(config: Any) -> dict[str, Any]:
         ),
         "hidden_size": int(getattr(config, "hidden_size", language.hidden_size)),
         "global_layers": int(getattr(language, "num_hidden_layers", 0)),
+        "global_num_attention_heads": int(language.num_attention_heads),
+        "global_num_query_groups": int(language.num_key_value_heads),
+        "global_ffn_hidden_size": int(language.intermediate_size),
+        "global_rope_base": float(getattr(language, "rope_theta", 1_000_000.0)),
+        "global_layer_norm_epsilon": float(language.rms_norm_eps),
+        "qk_layernorm": bool(getattr(language, "qk_layernorm", True)),
         "local_layers": int(getattr(config, "local_transformer_layers", 1)),
-        "local_num_attention_heads": int(getattr(local, "n_head")),
-        "local_ffn_hidden_size": int(getattr(local, "n_inner")),
-        "local_rope_base": float(getattr(local, "rope_base")),
-        "local_layer_norm_epsilon": float(getattr(local, "layer_norm_epsilon")),
-        "tie_audio_embeddings": True,
-        "sample_rate": 48000,
+        "local_num_attention_heads": int(
+            getattr(local, "n_head", getattr(local, "num_attention_heads", 0))
+        ),
+        "local_ffn_hidden_size": int(
+            getattr(local, "n_inner", getattr(local, "intermediate_size", 0))
+        ),
+        "local_rope_base": float(
+            getattr(local, "rope_base", None)
+            or local_rope_from_parameters
+            or 1_000_000.0
+        ),
+        "local_layer_norm_epsilon": float(
+            getattr(
+                local,
+                "layer_norm_epsilon",
+                getattr(local, "layer_norm_eps", 1e-6),
+            )
+        ),
+        "local_activation": str(
+            getattr(
+                local,
+                "activation_function",
+                getattr(local, "hidden_act", "silu"),
+            )
+        ),
+        "tie_audio_embeddings_and_output_weights": bool(
+            getattr(config, "tie_audio_embeddings_and_output_weights", False)
+        ),
+        "embedding_head_storage": "split_v1",
+        "sample_rate": int(getattr(config, "sampling_rate", 48000)),
     }
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     identity["config_sha256"] = hashlib.sha256(encoded).hexdigest()
@@ -142,7 +180,7 @@ def build_moss_tts_local_rollout_trace(
     code_mask = torch.ones_like(codes, dtype=torch.bool)
     return {
         "version": MOSS_TTS_LOCAL_ROLLOUT_VERSION,
-        "model_family": "moss_tts_local_v1_5",
+        "model_family": "moss_tts_local",
         "stages": ["tts_engine"],
         "request_id": str(request_id),
         "model_identity": moss_tts_local_model_identity(model_config),

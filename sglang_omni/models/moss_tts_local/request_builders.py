@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +33,7 @@ from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_
 from sglang_omni.scheduling.types import ARRequestData
 
 _MOSS_TTS_LOCAL_PREPARED_MARKER = "_moss_tts_local_prepared_request"
+_MOSS_TTS_RESERVED_TOKEN = re.compile(r"<\|[^<>]*\|>")
 
 
 @dataclass
@@ -240,6 +242,51 @@ def build_generation_kwargs(
     return generation_kwargs
 
 
+def render_moss_tts_v2_generation_prompt(
+    *,
+    script: str,
+    reference_count: int,
+    global_instruction: str | None,
+    global_tokens: int | None,
+) -> str:
+    """Render exactly mossLite's moss_tts_v2 revision-3 generate prompt."""
+
+    if not isinstance(script, str) or not script.strip():
+        raise ValueError("MOSS-TTS v2 script must be a non-empty string.")
+    reserved = _MOSS_TTS_RESERVED_TOKEN.search(script)
+    if reserved is not None:
+        raise ValueError(
+            "MOSS-TTS v2 script contains reserved special-token-shaped text "
+            f"{reserved.group()!r}."
+        )
+    if reference_count < 0:
+        raise ValueError("MOSS-TTS v2 reference_count must be non-negative.")
+    instruction = None
+    if global_instruction is not None and str(global_instruction).strip():
+        instruction = str(global_instruction)
+        reserved = _MOSS_TTS_RESERVED_TOKEN.search(instruction)
+        if reserved is not None:
+            raise ValueError(
+                "MOSS-TTS v2 global instruction contains reserved "
+                f"special-token-shaped text {reserved.group()!r}."
+            )
+    sections = ["paradigm: generate"]
+    if reference_count:
+        sections.append(
+            "\n".join(
+                f"audio{index}: <|audio|>" for index in range(1, reference_count + 1)
+            )
+        )
+    sections.extend(
+        (
+            f"script: {script}",
+            "global instruction: " + (instruction or "None"),
+            f"global tokens: {global_tokens}",
+        )
+    )
+    return "\n\n".join(sections)
+
+
 def _build_processor_message(
     processor: Any,
     state: MossTTSLocalState,
@@ -254,13 +301,17 @@ def _build_processor_message(
             reference = [reference_encoder.encode_data_uri(ref_audio)]
     else:
         reference = _reference_for_processor(processor, ref_audio)
-    return processor.build_user_message(
-        text=state.text,
-        reference=reference,
-        instruction=state.instructions,
-        tokens=state.token_count,
-        language=state.language,
-    )
+    audio_codes_list = list(reference or [])
+    return {
+        "role": "user",
+        "content": render_moss_tts_v2_generation_prompt(
+            script=state.text,
+            reference_count=len(audio_codes_list),
+            global_instruction=state.instructions,
+            global_tokens=state.token_count,
+        ),
+        "audio_codes_list": audio_codes_list,
+    }
 
 
 def _prepare_moss_tts_local_request(
