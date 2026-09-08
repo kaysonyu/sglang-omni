@@ -390,6 +390,12 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
+        if getattr(self, "_moss_local_score_only", False):
+            return LogitsProcessorOutput(
+                next_token_logits=hidden_states.new_zeros((len(forward_batch.extend_seq_lens_cpu), 1)),
+                hidden_states=hidden_states,
+            )
+
         sample_hidden_states = self._select_sample_hidden_states(
             hidden_states,
             forward_batch,
@@ -826,6 +832,9 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
 
         return {
+            "teacher_weight_sha256": getattr(self, "_moss_teacher_weight_sha256", None),
+            "supports_action_scoring": bool(getattr(self, "_moss_local_score_only", False)),
+            "supports_weight_update": not bool(getattr(self, "_moss_local_score_frozen", False)),
             "model_identity": moss_tts_local_model_identity(self.config),
             "rollout_schema_versions": [MOSS_TTS_LOCAL_ROLLOUT_VERSION],
             "logprob_semantics": MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,

@@ -283,6 +283,9 @@ def create_app(
     _register_chat_completions(app)
     _register_voices(app)
     _register_generate(app)
+    from sglang_omni.serve.local_scoring import register_local_scoring
+
+    register_local_scoring(app)
     _register_speech(app)
     _register_speech_batch(app)
     _register_speech_ws(app)

@@ -279,9 +279,35 @@ class MossTTSLocalSplitPipelineConfig(MossTTSLocalPipelineConfig):
     )
 
 
+class MossTTSLocalScorePipelineConfig(MossTTSLocalPipelineConfig):
+    """Frozen teacher prefill; no tokenizer, sampling, codec or vocoder stages."""
+
+    @classmethod
+    def process_local_edges(cls):
+        return frozenset()
+
+    stages: list[StageConfig] = Field(default_factory=lambda: [
+        EngineStageConfig(
+            name="tts_engine", process="teacher", gpu=0, terminal=True,
+            factory_path=f"{_PKG}.scoring.create_score_engine",
+            factory=FactoryArgs(dtype="bfloat16", score_chunk_size=128),
+            engine=EngineArgs(disable_cuda_graph=True, disable_radix_cache=True,
+                              chunked_prefill_size=-1, max_total_tokens=8192, mem_fraction_static=0.2),
+        )
+    ])
+
+
+class MossTTSLocalStudentScorePipelineConfig(MossTTSLocalScorePipelineConfig):
+    """Updatable scoring replica; kept distinct from rollout and frozen teachers."""
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, Any]:
+        return {"frozen": False} if stage_name == "tts_engine" else {}
+
+
 EntryClass = MossTTSLocalPipelineConfig
 
 Variants = {
+    "student_score": MossTTSLocalStudentScorePipelineConfig,
+    "score": MossTTSLocalScorePipelineConfig,
     "default": MossTTSLocalPipelineConfig,
     "colocated": MossTTSLocalColocatedPipelineConfig,
     "split": MossTTSLocalSplitPipelineConfig,

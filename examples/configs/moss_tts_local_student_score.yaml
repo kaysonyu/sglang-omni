@@ -1,0 +1,2 @@
+config_cls: MossTTSLocalStudentScorePipelineConfig
+model_path: OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
