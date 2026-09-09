@@ -319,6 +319,18 @@ class MossTTSLocalModelRunner(ModelRunner):
         audio_top_p = params["audio_top_p"]
         audio_top_k = params["audio_top_k"]
         sampling_seeds = params["seeds"]
+        trace_flags = [
+            bool(
+                getattr(sched_req.data, "return_omni_rollout", False)
+                and getattr(sched_req.data, "return_logprob", False)
+            )
+            for sched_req in requests
+        ]
+        if any(trace_flags) and not all(trace_flags):
+            raise ValueError(
+                "MOSS-TTS Local cannot mix structured-rollout and ordinary requests in one decode batch yet"
+            )
+        capture_rollout_logprobs = bool(trace_flags and all(trace_flags))
         # Advance the launch-side counter only for emitted rows; non-final
         # chunked rows take a read-only position so a mid-prefill chunk's frame
         # cannot shift the final chunk's sampling position off the no-chunk path.
@@ -371,10 +383,13 @@ class MossTTSLocalModelRunner(ModelRunner):
         except AttributeError:
             frame_graph_max_bs = 0
         use_graph = (
-            not has_audio_repetition_penalty and batch_size <= frame_graph_max_bs
+            not has_audio_repetition_penalty
+            and batch_size <= frame_graph_max_bs
         )
+        decision_logprobs = None
+        code_logprobs = None
         if use_graph:
-            stop_choice, codes, feedback = self.model.decode_frame_graphed(
+            graph_output = self.model.decode_frame_graphed(
                 hidden_states,
                 text_temperature=text_temp,
                 text_top_p=text_top_p,
@@ -384,17 +399,43 @@ class MossTTSLocalModelRunner(ModelRunner):
                 audio_top_k=audio_top_k,
                 seeds=sampling_seeds,
                 base_positions=gen_steps * num_channels,
+                return_logprobs=capture_rollout_logprobs,
             )
+            if capture_rollout_logprobs:
+                (
+                    stop_choice,
+                    codes,
+                    feedback,
+                    decision_logprobs,
+                    code_logprobs,
+                ) = graph_output
+            else:
+                stop_choice, codes, feedback = graph_output
             # The graph outputs are static buffers that the next replay (any
             # later prefill or decode step) overwrites; snapshot what we keep.
             codes = codes.clone()
             embeds = feedback.clone()
+            if decision_logprobs is not None:
+                decision_logprobs = decision_logprobs.clone()
+            if code_logprobs is not None:
+                code_logprobs = code_logprobs.clone()
         else:
-            stop_choice, codes = self.model.decode_frame(
-                hidden_states,
-                sample_text=sample_text,
-                sample_audio=sample_audio,
-            )
+            if capture_rollout_logprobs:
+                stop_choice, codes, decision_logprobs, code_logprobs = (
+                    self.model.decode_frame_with_logprobs(
+                        hidden_states,
+                        sample_text=sample_text,
+                        sample_audio=sample_audio,
+                        text_temperature=text_temp,
+                        audio_temperature=audio_temp,
+                    )
+                )
+            else:
+                stop_choice, codes = self.model.decode_frame(
+                    hidden_states,
+                    sample_text=sample_text,
+                    sample_audio=sample_audio,
+                )
             embeds = None
 
         slot_id = int(cfg.audio_assistant_slot_token_id)
@@ -451,6 +492,27 @@ class MossTTSLocalModelRunner(ModelRunner):
                 rids=[requests[i].request_id for i in emit_indices],
                 pool_rows=emit_pool_rows,
                 rows=emit_rows,
+                decisions=(
+                    stop_choice.index_select(
+                        0, emit_index_t.to(device=stop_choice.device)
+                    ).clone()
+                    if capture_rollout_logprobs
+                    else None
+                ),
+                decision_logprobs=(
+                    decision_logprobs.index_select(
+                        0, emit_index_t.to(device=decision_logprobs.device)
+                    ).clone()
+                    if decision_logprobs is not None
+                    else None
+                ),
+                code_logprobs=(
+                    code_logprobs.index_select(
+                        0, emit_index_t.to(device=code_logprobs.device)
+                    ).clone()
+                    if code_logprobs is not None
+                    else None
+                ),
             )
         # Always return rows so both the sync inline path and the async launch
         # publish next_token_ids; an all-chunked batch just attaches no journal.
@@ -675,6 +737,23 @@ class MossTTSLocalModelRunner(ModelRunner):
                 if (callable(finished_fn) and finished_fn()) or bool(is_retracted):
                     continue
             req_output = outputs[sched_req.request_id]
+            if getattr(sched_req.data, "return_omni_rollout", False):
+                if (
+                    journal.decisions is None
+                    or journal.decision_logprobs is None
+                    or journal.code_logprobs is None
+                ):
+                    raise RuntimeError(
+                        "MOSS-TTS Local structured rollout journal is missing action logprobs"
+                    )
+                decision = int(journal.decisions[i].item())
+                sched_req.data.output_decisions.append(decision)
+                sched_req.data.output_decision_logprobs.append(
+                    journal.decision_logprobs[i]
+                    .detach()
+                    .to("cpu", torch.float32)
+                    .clone()
+                )
             if req_output.data is None or int(req_output.data) == end_id:
                 self._flush_stream_rows(
                     sched_req.request_id,
@@ -683,6 +762,14 @@ class MossTTSLocalModelRunner(ModelRunner):
                 )
                 continue
             sched_req.data.output_rows.append(journal.rows[i])
+            if getattr(sched_req.data, "return_omni_rollout", False):
+                if int(journal.decisions[i].item()) != 0:
+                    raise RuntimeError(
+                        "MOSS-TTS Local emitted an audio row for a stop decision"
+                    )
+                sched_req.data.output_code_logprobs.append(
+                    journal.code_logprobs[i].detach().to("cpu", torch.float32).clone()
+                )
             stream_metadata = getattr(sched_req.data, "stream_metadata", None)
             if stream_metadata is None or self._outbox is None:
                 continue

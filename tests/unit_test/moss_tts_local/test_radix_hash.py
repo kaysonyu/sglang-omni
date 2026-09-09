@@ -20,7 +20,7 @@ from sglang_omni.models.moss_tts_local.radix_hash import (
 )
 
 _N_CHANNELS = 13  # text channel + 12 RVQ codes (n_vq = 12)
-_END_ID = 151670  # audio_end_token_id: in the special band (>= RADIX_HASH_SPACE)
+_END_ID = 151653  # audio_end_token_id: in the special band (>= RADIX_HASH_SPACE)
 _SLOT_ID = 151646  # audio_assistant_slot_token_id: text channel of a continuing frame
 
 

@@ -140,6 +140,7 @@ class Client:
                 id=f"audio-{request_id}",
                 data=audio_b64,
                 transcript=full_text if full_text else None,
+                sample_rate=sample_rate,
             )
 
         return CompletionResult(
