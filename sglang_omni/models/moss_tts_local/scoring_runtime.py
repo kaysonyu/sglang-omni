@@ -94,4 +94,3 @@ def score_result(data):
             "finish_reason": "stop",
         },
     )
-

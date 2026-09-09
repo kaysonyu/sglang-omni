@@ -44,5 +44,3 @@ def score_local_depth(
                 )
         code_parts.append(torch.stack(columns, dim=-1))
     return torch.cat(decision_parts), torch.cat(code_parts)
-
-
