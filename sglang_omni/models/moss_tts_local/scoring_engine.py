@@ -103,10 +103,9 @@ class LocalScoreModelRunner(ModelRunner):
 
 
 class LocalScoreEngineBuilder(MossTtsLocalEngineBuilder):
-    def __init__(self, *, score_chunk_size=128, frozen=True, **kwargs):
+    def __init__(self, *, score_chunk_size=128, **kwargs):
         super().__init__(**kwargs)
         self.score_chunk_size = score_chunk_size
-        self.frozen = frozen
 
     def generation_defaults(self, *, dtype):
         defaults = super().generation_defaults(dtype=dtype)
@@ -141,7 +140,7 @@ class LocalScoreEngineBuilder(MossTtsLocalEngineBuilder):
                 "Local MOPD scoring currently requires unquantized weights"
             )
         model._moss_local_score_only = True
-        model._moss_local_score_frozen = self.frozen
+        model._moss_local_score_frozen = True
 
     def make_model_runner(self, model_worker, output_proc):
         return LocalScoreModelRunner(
@@ -155,9 +154,6 @@ class LocalScoreEngineBuilder(MossTtsLocalEngineBuilder):
         return None
 
     def post_scheduler_setup(self, scheduler, model_runner):
-        if not self.frozen:
-            self.model._moss_teacher_weight_sha256 = None
-            return
         from sglang_omni.model_runner.weight_checker import StrictWeightChecker
 
         class ParameterChecker(StrictWeightChecker):
@@ -185,11 +181,9 @@ def create_score_engine(
     total_gpu_memory_fraction=None,
     process_total_gpu_memory_fraction=None,
     score_chunk_size=128,
-    frozen=True,
 ):
     return LocalScoreEngineBuilder(
         score_chunk_size=score_chunk_size,
-        frozen=frozen,
         enable_async_decode=False,
         async_decode_min_batch_size=2,
         prefill_coalesce_requests=4,

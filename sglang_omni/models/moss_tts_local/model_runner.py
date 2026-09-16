@@ -383,8 +383,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         except AttributeError:
             frame_graph_max_bs = 0
         use_graph = (
-            not has_audio_repetition_penalty
-            and batch_size <= frame_graph_max_bs
+            not has_audio_repetition_penalty and batch_size <= frame_graph_max_bs
         )
         decision_logprobs = None
         code_logprobs = None

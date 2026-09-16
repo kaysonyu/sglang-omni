@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from sglang_omni.models.moss_tts_local.rollout_trace import selected_action_logprobs
 
+
 @torch.no_grad()
 def score_local_depth(
     model, hidden, decisions, padded_codes, *, temperature, chunk_size

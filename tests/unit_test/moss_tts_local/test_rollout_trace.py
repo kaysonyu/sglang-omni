@@ -26,6 +26,7 @@ def _config():
         rms_norm_eps=1e-6,
     )
     local = SimpleNamespace(
+        activation_function="silu",
         n_head=32,
         n_inner=9728,
         rope_base=1_000_000.0,

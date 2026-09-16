@@ -230,7 +230,7 @@ class RolloutGenerateRequest(BaseModel):
     model: str | None = None
 
     input_ids: list[int] | None = None
-    prompt: str | None = None
+    prompt: str | dict[str, Any] | None = None
     messages: list[RolloutMessage] | None = None
 
     sampling_params: RolloutSamplingParams = Field(

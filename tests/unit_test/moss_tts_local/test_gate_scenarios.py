@@ -48,6 +48,7 @@ tiering, that the rep-penalty scenario actually carries a penalty request (else
 its ``counter == 0`` check is vacuous), and that the comparison flags shape AND
 value drift while the counter assertion distinguishes engaged from sync-routed.
 """
+
 from __future__ import annotations
 
 import os

@@ -1,0 +1,25 @@
+{
+  "reported_commit": "92a53c268a167e153cbe7f36b1d916b8a72c0b4f",
+  "source_directory": "/inspire/ssd/project/cq-scientific-cooperation-zone/public/kyu/src/sglang-omni-tmp",
+  "git_metadata_present": false,
+  "scope": "MOSS Local model/processor/codec base; RL capture and scoring added on top",
+  "source_sha256": {
+    "sglang_omni/models/moss_tts_local/__init__.py": "6af9b4955c9c6aaed169f61b68cd67022afa07de2f0be6bc2218cd61ac2634ce",
+    "sglang_omni/models/moss_tts_local/config.py": "23b881b8ded9ef9cec661abcf1938b6a3a875ca9468de97f4d6daa80f20b5849",
+    "sglang_omni/models/moss_tts_local/engine_builder.py": "4a576a4148e9ceb1eb9ae5a9955785c21601f53d1a36f6541f1ced73855442fc",
+    "sglang_omni/models/moss_tts_local/local_transformer.py": "c1470937bd762ba291c452a0dc3652455f2f76115b8cb38bcd3fa72f32ccfa5b",
+    "sglang_omni/models/moss_tts_local/model_runner.py": "f18db64d678ab182057e2512546abb6873385df26ce3d0d978f50d96ff599627",
+    "sglang_omni/models/moss_tts_local/payload_types.py": "7d4c3cbadf458814332effebf22dcc21d4f16a8156015920019d9008bfd17b84",
+    "sglang_omni/models/moss_tts_local/radix_hash.py": "15c0874ef5eb9c5790f9399d23083999dbdfbc0ff17de319e0cc83717fb53f01",
+    "sglang_omni/models/moss_tts_local/request_builders.py": "9d80517d35a75646d1a35ca4c625c75fcb6d6f01517e9b0e7520b71fd02b6714",
+    "sglang_omni/models/moss_tts_local/sglang_model.py": "d955e07b9aa69cfa8c2eaa7986862fda7ac8473c3a97008246ba887b5605f865",
+    "sglang_omni/models/moss_tts_local/stages.py": "ad69b9714316382ad93c60fb981e0e40803098dd4596b90c96f4daadd2c265a3",
+    "sglang_omni/models/moss_tts_local/state_pool.py": "033e8b3f74decd36e1254ee6b969ca24b8c2eee08245fb614d2e0daf9da4e5de",
+    "sglang_omni/models/moss_tts_local/streaming_vocoder.py": "6991da8b973987de65a4dc56f64965d710c3d79041b82ea8b34c09d6d1b3005d",
+    "sglang_omni/models/moss_tts_local/vocoder_cuda_graph.py": "a830732226303d4f12b4265d1fae208053ae42c7efd17e51c9389ca7182bafaf",
+    "sglang_omni/models/moss_tts/audio_tokenizer.py": "3161f1504ba871ea017d5f7ad9181b6592a32bf631e4710d88d739914ad12431",
+    "sglang_omni/models/moss_tts/attention.py": "2c5df5a0b8a28f6c4285908c331d9a695964469b7a52d37c7d15f245577ac5ab",
+    "sglang_omni/models/moss_tts/vocoder_kernels.py": "961bdcef74a7f76156036905634e05db20e8a8598764dea4c78d81dfc25795e3",
+    "sglang_omni/models/moss_tts/vocoder_quantizer.py": "dfeff90de1904e4dfa55ab429f1bc27b547f46c17c803d88ab9b64485aecf4e3"
+  }
+}

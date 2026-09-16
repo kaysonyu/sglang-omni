@@ -42,17 +42,9 @@ def moss_tts_local_model_identity(config: Any) -> dict[str, Any]:
         or getattr(config, "qwen3_config", None)
         or config
     )
-    local = (
-        getattr(config, "gpt2_config", None)
-        or getattr(config, "gpt_neox_config", None)
-        or getattr(config, "local_config", None)
-        or config
-    )
-    local_rope_parameters = getattr(local, "rope_parameters", None)
-    if isinstance(local_rope_parameters, dict):
-        local_rope_from_parameters = local_rope_parameters.get("rope_theta")
-    else:
-        local_rope_from_parameters = getattr(local_rope_parameters, "rope_theta", None)
+    local = config.gpt2_config
+    if not isinstance(local, dict):
+        local = vars(local)
     identity = {
         "policy_family": "moss_tts_local",
         "architecture": "MOSS-TTS-Local",
@@ -75,31 +67,11 @@ def moss_tts_local_model_identity(config: Any) -> dict[str, Any]:
         "global_layer_norm_epsilon": float(language.rms_norm_eps),
         "qk_layernorm": bool(getattr(language, "qk_layernorm", True)),
         "local_layers": int(getattr(config, "local_transformer_layers", 1)),
-        "local_num_attention_heads": int(
-            getattr(local, "n_head", getattr(local, "num_attention_heads", 0))
-        ),
-        "local_ffn_hidden_size": int(
-            getattr(local, "n_inner", getattr(local, "intermediate_size", 0))
-        ),
-        "local_rope_base": float(
-            getattr(local, "rope_base", None)
-            or local_rope_from_parameters
-            or 1_000_000.0
-        ),
-        "local_layer_norm_epsilon": float(
-            getattr(
-                local,
-                "layer_norm_epsilon",
-                getattr(local, "layer_norm_eps", 1e-6),
-            )
-        ),
-        "local_activation": str(
-            getattr(
-                local,
-                "activation_function",
-                getattr(local, "hidden_act", "silu"),
-            )
-        ),
+        "local_num_attention_heads": int(local["n_head"]),
+        "local_ffn_hidden_size": int(local["n_inner"]),
+        "local_rope_base": float(local["rope_base"]),
+        "local_layer_norm_epsilon": float(local["layer_norm_epsilon"]),
+        "local_activation": str(local["activation_function"]),
         "tie_audio_embeddings_and_output_weights": bool(
             getattr(config, "tie_audio_embeddings_and_output_weights", False)
         ),

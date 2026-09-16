@@ -372,6 +372,10 @@ class ModelWorker:
             "model_arch_override": self.model_arch_override,
             "supports_weight_update": True,
             "supports_weight_checker": True,
+            "weight_update_environment": {
+                key: os.environ.get(key)
+                for key in ("NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE")
+            },
             "prefill_cuda_graph": self._prefill_cuda_graph_info(),
         }
         rollout_model_info = getattr(
@@ -386,7 +390,15 @@ class ModelWorker:
             info.update(extra)
         return info
 
+    def _weight_updates_enabled(self) -> bool:
+        describe = getattr(
+            getattr(self.model_runner, "model", None), "rollout_model_info", None
+        )
+        return not callable(describe) or describe().get("supports_weight_update", True)
+
     def update_weights_from_disk(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        if not self._weight_updates_enabled():
+            return False, "This stage is a frozen scorer; weight updates are disabled"
         model_path = payload.get("model_path")
         if not model_path:
             return False, "model_path is required"
@@ -411,6 +423,8 @@ class ModelWorker:
         return bool(success), str(message)
 
     def update_weights_from_tensor(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        if not self._weight_updates_enabled():
+            return False, "This stage is a frozen scorer; weight updates are disabled"
         if payload.get("serialized_named_tensors") is not None:
             return (
                 False,
@@ -420,6 +434,8 @@ class ModelWorker:
         return self._call_optional_weight_method("update_weights_from_tensor", payload)
 
     def init_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        if not self._weight_updates_enabled():
+            return False, "This stage is a frozen scorer; weight updates are disabled"
         init = self.model_runner.init_weights_update_group
         master_address = payload.get("master_address")
         master_port = payload.get("master_port")
@@ -450,6 +466,8 @@ class ModelWorker:
     def update_weights_from_distributed(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str]:
+        if not self._weight_updates_enabled():
+            return False, "This stage is a frozen scorer; weight updates are disabled"
         update = self.model_runner.update_weights_from_distributed
         names = payload.get("names")
         dtypes = payload.get("dtypes")
@@ -484,6 +502,8 @@ class ModelWorker:
         return bool(success), str(message)
 
     def weights_checker(self, action: str) -> dict[str, Any]:
+        if action == "reset_tensors" and not self._weight_updates_enabled():
+            return {"success": False, "message": "This stage is a frozen scorer; weight mutation is disabled"}
         checker = getattr(self, "_strict_weight_checker", None)
         if checker is None:
             from sglang_omni.model_runner.weight_checker import StrictWeightChecker

@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
+from sglang_omni.models.moss_tts.audio_tokenizer import (
+    _STREAMING_ROPE_CACHE_DURATION_SECONDS,
+)
 from sglang_omni.models.moss_tts.request_builders import (
     _DATA_URI_RE,
     MOSS_TTS_DEFAULT_MAX_NEW_TOKENS,
@@ -33,7 +35,10 @@ from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_
 from sglang_omni.scheduling.types import ARRequestData
 
 _MOSS_TTS_LOCAL_PREPARED_MARKER = "_moss_tts_local_prepared_request"
-_MOSS_TTS_RESERVED_TOKEN = re.compile(r"<\|[^<>]*\|>")
+_MOSS_TTS_LOCAL_AUDIO_FRAME_RATE = 12.5
+_MOSS_TTS_LOCAL_MAX_STREAMING_TOKENS = int(
+    _STREAMING_ROPE_CACHE_DURATION_SECONDS * _MOSS_TTS_LOCAL_AUDIO_FRAME_RATE
+)
 
 
 @dataclass
@@ -133,12 +138,22 @@ def pop_prepared_moss_tts_local_request(
 
 
 def build_moss_tts_local_state(payload: StagePayload) -> MossTTSLocalState:
+    from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+
     inputs = payload.request.inputs or {}
-    params = payload.request.params or {}
+    params = dict(payload.request.params or {})
+    # Preprocessing resolves generation settings before the AR stage sees the
+    # request. Apply that stage's public overrides here as well.
+    params.update((params.get("stage_params") or {}).get("tts_engine") or {})
     metadata = payload.request.metadata or {}
     tts_params = metadata.get("tts_params")
     if not isinstance(tts_params, dict):
         tts_params = {}
+    else:
+        tts_params = dict(tts_params)
+    explicit = metadata.get(EXPLICIT_GENERATION_PARAMS_KEY)
+    if explicit is not None:
+        tts_params["explicit_generation_params"] = explicit
 
     text, references = normalize_moss_tts_inputs(inputs)
     ref_audio, ref_text = resolve_moss_reference(references, tts_params)
@@ -188,6 +203,10 @@ def build_generation_kwargs(
     else:
         max_new_tokens = int(raw_max_new_tokens)
 
+    if params.get("stream") and max_new_tokens > _MOSS_TTS_LOCAL_MAX_STREAMING_TOKENS:
+        raise ValueError(
+            f"MOSS Local streaming max_new_tokens must be <= {_MOSS_TTS_LOCAL_MAX_STREAMING_TOKENS}"
+        )
     generation_kwargs: dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
         "text_temperature": 1.0,
@@ -242,51 +261,6 @@ def build_generation_kwargs(
     return generation_kwargs
 
 
-def render_moss_tts_v2_generation_prompt(
-    *,
-    script: str,
-    reference_count: int,
-    global_instruction: str | None,
-    global_tokens: int | None,
-) -> str:
-    """Render exactly mossLite's moss_tts_v2 revision-3 generate prompt."""
-
-    if not isinstance(script, str) or not script.strip():
-        raise ValueError("MOSS-TTS v2 script must be a non-empty string.")
-    reserved = _MOSS_TTS_RESERVED_TOKEN.search(script)
-    if reserved is not None:
-        raise ValueError(
-            "MOSS-TTS v2 script contains reserved special-token-shaped text "
-            f"{reserved.group()!r}."
-        )
-    if reference_count < 0:
-        raise ValueError("MOSS-TTS v2 reference_count must be non-negative.")
-    instruction = None
-    if global_instruction is not None and str(global_instruction).strip():
-        instruction = str(global_instruction)
-        reserved = _MOSS_TTS_RESERVED_TOKEN.search(instruction)
-        if reserved is not None:
-            raise ValueError(
-                "MOSS-TTS v2 global instruction contains reserved "
-                f"special-token-shaped text {reserved.group()!r}."
-            )
-    sections = ["paradigm: generate"]
-    if reference_count:
-        sections.append(
-            "\n".join(
-                f"audio{index}: <|audio|>" for index in range(1, reference_count + 1)
-            )
-        )
-    sections.extend(
-        (
-            f"script: {script}",
-            "global instruction: " + (instruction or "None"),
-            f"global tokens: {global_tokens}",
-        )
-    )
-    return "\n\n".join(sections)
-
-
 def _build_processor_message(
     processor: Any,
     state: MossTTSLocalState,
@@ -301,17 +275,13 @@ def _build_processor_message(
             reference = [reference_encoder.encode_data_uri(ref_audio)]
     else:
         reference = _reference_for_processor(processor, ref_audio)
-    audio_codes_list = list(reference or [])
-    return {
-        "role": "user",
-        "content": render_moss_tts_v2_generation_prompt(
-            script=state.text,
-            reference_count=len(audio_codes_list),
-            global_instruction=state.instructions,
-            global_tokens=state.token_count,
-        ),
-        "audio_codes_list": audio_codes_list,
-    }
+    return processor.build_user_message(
+        text=state.text,
+        reference=reference,
+        instruction=state.instructions,
+        tokens=state.token_count,
+        language=state.language,
+    )
 
 
 def _prepare_moss_tts_local_request(
@@ -523,6 +493,8 @@ def apply_sglang_moss_tts_local_result(
         generated_rows = torch.stack(data.output_rows, dim=0).to(dtype=torch.long)
         state.audio_codes = generated_rows[:, 1:].detach().cpu()
     else:
+        if not data.return_omni_rollout:
+            raise RuntimeError("MOSS-TTS Local generated no audio frames")
         state.audio_codes = torch.empty((0, n_vq), dtype=torch.long)
 
     state.prompt_tokens = len(data.input_ids) if data.input_ids is not None else 0

@@ -1,7 +1,8 @@
 import pytest
+
 from sglang_omni.models.moss_tts_local.scoring_protocol import (
-    LocalScoreInput,
     LocalScoreBatch,
+    LocalScoreInput,
 )
 
 

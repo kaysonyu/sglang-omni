@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.models.moss_tts_local.sglang_model import (
@@ -26,6 +27,7 @@ def _tiny_model() -> MossTTSLocalSGLangModel:
     )
     model.hidden_size = 2
     model.n_vq = 1
+    model._audio_heads_initialized = False
     model.embedding_list = torch.nn.ModuleList(
         [torch.nn.Embedding(4, 2), torch.nn.Embedding(4, 2)]
     )
@@ -89,3 +91,16 @@ def test_weight_loader_updates_independent_audio_head():
         model.audio_lm_heads[0].weight,
         model.embedding_list[1].weight[:3],
     )
+
+
+def test_runtime_rejects_original_neox_weight_names():
+    model = _tiny_model()
+    with pytest.raises(ValueError, match="offline HF-to-Local converter"):
+        model.load_weights(
+            [
+                (
+                    "local_transformer.layers.0.attention.query_key_value.weight",
+                    torch.zeros(6, 2),
+                )
+            ]
+        )

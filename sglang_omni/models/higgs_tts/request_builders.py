@@ -41,6 +41,7 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     output_code_count: int = 0
     output_logprobs: list[torch.Tensor] = field(default_factory=list)
     return_omni_rollout: bool = False
+    admission_weight_version: str | None = None
     generation_done: bool = False
     engine_start_s: float = 0.0
     stream_metadata: dict[str, Any] | None = None
@@ -100,6 +101,16 @@ def build_sglang_higgs_request(
     # scheduler's update_finish_state trips on ``len(None)``.
     sampling_params.normalize(tokenizer=None)
 
+    admission_version = None
+    if state.return_omni_rollout:
+        if not state.return_logprob:
+            raise ValueError("Higgs RL trace requires return_logprob=true")
+        if state.temperature <= 0 or state.top_p not in (None, 1.0) or state.top_k not in (None, -1):
+            raise ValueError("Higgs RL replay requires positive temperature, top_p=1 and top_k=-1")
+        from sglang.srt.runtime_context import get_serving
+
+        admission_version = str(get_serving().weight_version)
+
     # vocab_size = backbone text vocab so cb0 rides sglang's standard sampler path.
     # extra_key namespaces the radix cache per ref-audio fingerprint so prompts
     # sharing the -100 placeholder prefix can never cross-contaminate KV.
@@ -127,6 +138,7 @@ def build_sglang_higgs_request(
         top_k=int(state.top_k) if state.top_k is not None else -1,
         return_logprob=bool(state.return_logprob),
         return_omni_rollout=bool(state.return_omni_rollout),
+        admission_weight_version=admission_version,
     )
 
 
@@ -195,7 +207,12 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
             codebook_vocab_size=int(data.codebook_size),
             delayed_logprobs=logprobs,
         )
+        from sglang_omni.models.higgs_tts.rl_contract import complete_replay_trace
+
+        complete_replay_trace(state.omni_rollout, data)
     state.prompt_tokens = len(data.input_ids)
+    state.finish_reason = data.finish_reason
+    state.weight_version = data.weight_version
 
 
 def make_higgs_scheduler_adapters(

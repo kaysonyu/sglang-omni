@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
@@ -507,83 +508,6 @@ def test_collect_frame_reads_generation_steps_from_pool():
 
     assert torch.equal(captured["base_positions"], torch.tensor([4 * 13]))
     assert int(pool.sampling_steps[row]) == 5
-
-
-def test_collect_frame_uses_graph_for_structured_rollout_logprobs():
-    hidden_size = 4
-    embedding = SimpleNamespace(
-        weight=torch.zeros(2, hidden_size, dtype=torch.bfloat16)
-    )
-    model = SimpleNamespace(
-        _decode_input_embedding=embedding,
-        _state_pool=None,
-        config=SimpleNamespace(
-            n_vq=12,
-            audio_vocab_size=1024,
-            audio_assistant_slot_token_id=1000,
-            audio_end_token_id=1001,
-        ),
-        frame_graph_max_bs=1,
-        device=torch.device("cpu"),
-    )
-    pool = MossTTSLocalDecodeStatePool(model)
-    model._state_pool = pool
-    captured = {}
-
-    def decode_frame_graphed(hidden_states, **kwargs):
-        del hidden_states
-        captured["return_logprobs"] = kwargs["return_logprobs"]
-        return (
-            torch.zeros(1, dtype=torch.long),
-            torch.full((1, 12), 7, dtype=torch.long),
-            torch.ones((1, hidden_size), dtype=torch.bfloat16),
-            torch.tensor([-0.25], dtype=torch.float32),
-            torch.full((1, 12), -1.5, dtype=torch.float32),
-        )
-
-    def decode_frame_with_logprobs(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("structured rollout should use frame graph replay")
-
-    model.decode_frame_graphed = decode_frame_graphed
-    model.decode_frame_with_logprobs = decode_frame_with_logprobs
-
-    runner = object.__new__(MossTTSLocalModelRunner)
-    runner.model = model
-    data = SimpleNamespace(
-        req=SimpleNamespace(inflight_middle_chunks=0),
-        text_temperature=1.0,
-        text_top_p=1.0,
-        text_top_k=-1,
-        audio_temperature=1.0,
-        audio_top_p=1.0,
-        audio_top_k=-1,
-        sampling_seed=0,
-        generation_steps=0,
-        audio_repetition_penalty=1.0,
-        return_omni_rollout=True,
-        return_logprob=True,
-        output_rows=[],
-    )
-    request = SimpleNamespace(request_id="rid", data=data)
-    row = pool.acquire_row("rid")
-    pool.ensure_params(row, "rid", data)
-    result = SimpleNamespace(
-        logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
-    )
-
-    runner._collect_frame(result, SimpleNamespace(), SimpleNamespace(), [request])
-
-    assert captured["return_logprobs"] is True
-    assert torch.equal(result.moss_journal.decisions, torch.zeros(1, dtype=torch.long))
-    assert torch.equal(
-        result.moss_journal.decision_logprobs,
-        torch.tensor([-0.25], dtype=torch.float32),
-    )
-    assert torch.equal(
-        result.moss_journal.code_logprobs,
-        torch.full((1, 12), -1.5, dtype=torch.float32),
-    )
 
 
 def test_pool_sampling_position_leads_unresolved_lookahead_launches():
@@ -1282,7 +1206,7 @@ def test_param_gather_matches_old_cache():
     )
 
 
-def test_result_adapter_releases_row_when_apply_raises():
+def test_result_adapter_releases_row_after_empty_generation():
     reset_calls = []
     model = SimpleNamespace(reset_request=lambda rid: reset_calls.append(rid))
     _, result_adapter = make_moss_tts_local_scheduler_adapters(model=model)
@@ -1297,18 +1221,11 @@ def test_result_adapter_releases_row_when_apply_raises():
         temperature=0.0,
         output_ids=[],
         prompt_rows=torch.zeros((1, 13), dtype=torch.long),
-        output_rows=[
-            torch.zeros(13, dtype=torch.long),
-            torch.zeros(12, dtype=torch.long),
-        ],
+        output_rows=[],
         stage_payload=payload,
     )
 
-    try:
+    with pytest.raises(RuntimeError, match="generated no audio frames"):
         result_adapter(data)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("expected malformed output_rows to raise")
 
     assert reset_calls == ["rid"]

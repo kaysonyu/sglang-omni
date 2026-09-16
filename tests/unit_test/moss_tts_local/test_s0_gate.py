@@ -8,6 +8,7 @@ identical fixed-seed inputs, must produce bit-identical output. Marked
 ``accelerator`` and auto-skipped without a CUDA device. Do not modify after
 initial commit.
 """
+
 from __future__ import annotations
 
 import pytest

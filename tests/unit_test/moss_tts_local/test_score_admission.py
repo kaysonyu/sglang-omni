@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
+
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler, _Upstream
 
 
