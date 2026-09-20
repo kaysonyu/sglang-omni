@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from typing import Any, ClassVar
+from pydantic import Field
 
 from sglang_omni.config import (
+    EngineArgs,
     EngineStageConfig,
     FactoryArgs,
     PipelineConfig,
@@ -144,3 +146,36 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
 
 EntryClass = HiggsTtsPipelineConfig
+
+
+class HiggsTtsScorePipelineConfig(PipelineConfig):
+    """Frozen supplied-action scoring without frontend, codec or vocoder work."""
+
+    architecture: ClassVar[str] = "HiggsMultimodalQwen3ForConditionalGeneration"
+    requires_model_capabilities: ClassVar[bool] = True
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "tts_engine": EngineStageConfig
+    }
+    model_path: str
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: [
+            EngineStageConfig(
+                name="tts_engine",
+                process="teacher",
+                gpu=0,
+                terminal=True,
+                factory_path=f"{_PKG}.scoring.create_score_engine",
+                factory=FactoryArgs(dtype="bfloat16"),
+                engine=EngineArgs(
+                    disable_cuda_graph=True,
+                    disable_radix_cache=True,
+                    chunked_prefill_size=-1,
+                    max_total_tokens=8192,
+                    mem_fraction_static=0.2,
+                ),
+            )
+        ]
+    )
+
+
+Variants = {"default": HiggsTtsPipelineConfig, "score": HiggsTtsScorePipelineConfig}

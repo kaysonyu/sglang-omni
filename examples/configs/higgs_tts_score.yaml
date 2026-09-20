@@ -1,0 +1,2 @@
+config_cls: HiggsTtsScorePipelineConfig
+model_path: Higgs-TTS-3-4B

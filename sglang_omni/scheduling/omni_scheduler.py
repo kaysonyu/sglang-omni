@@ -1334,6 +1334,23 @@ class OmniScheduler:
         return plan.batch_to_run
 
     def get_new_batch_prefill(self, running_batch):
+        if self.waiting_queue and getattr(self.waiting_queue[0], "_moss_score_group", None):
+            group_id = self.waiting_queue[0]._moss_score_group
+            expected = self.waiting_queue[0]._moss_score_group_size
+            ready = [req for req in self.waiting_queue if getattr(req, "_moss_score_group", None) == group_id]
+            if len(ready) != expected:
+                expired = time.perf_counter() - min(req._moss_score_group_created for req in ready) > 30.0
+                if expired or len(ready) > expected:
+                    for req in ready:
+                        self._emit_request_error(req.rid, ValueError("Incomplete atomic scoring group"))
+                        self.abort(req.rid)
+                return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+            deferred = [req for req in self.waiting_queue if getattr(req, "_moss_score_group", None) != group_id]
+            self.waiting_queue = sorted(ready, key=lambda req: req._moss_score_group_index)
+            try:
+                return _Upstream.get_new_batch_prefill(self, running_batch)
+            finally:
+                self.waiting_queue.extend(deferred)
         # Note: (maydomine) batch prefill admissions to amortize the fixed step
         # cost; the oldest-request deadline survives partial admission and aborts.
         #

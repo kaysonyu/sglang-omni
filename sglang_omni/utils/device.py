@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
 
 def _with_index(dev_type: str, raw_index: str, index: int | None) -> str:
     if index is not None:
@@ -45,3 +50,29 @@ def place_device_spec(device: str, index: int | None = None) -> str:
 
 
 __all__ = ["place_device_spec", "resolve_device_spec"]
+
+
+def resolve_concrete_device(
+    device: str | None, index: int | None = None
+) -> "torch.device":
+    """Resolve device/index to a concrete torch.device with an index.
+
+    Falls back to asking the host which card this process is already on
+    when neither the caller nor placement supplied an index, rather than
+    assuming 0.
+    """
+    import torch
+
+    concrete = torch.device(resolve_device_spec(device, index))
+    if concrete.type == "cpu" or concrete.index is not None:
+        return concrete
+    if concrete.type == "mps":
+        # note (lennox): Apple exposes one Metal device and torch.mps has no
+        # current_device(); see AppleOmniPlatform._validate_device_id.
+        return torch.device("mps", 0)
+    # note (lennox): built from the resolved type directly -- the platform
+    # object's get_device is NotImplemented on cpu-only hosts even when a
+    # test legitimately pins device_type.
+    return torch.device(
+        concrete.type, torch.get_device_module(concrete).current_device()
+    )

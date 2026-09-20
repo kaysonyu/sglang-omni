@@ -15,17 +15,17 @@ from typing import Any, TypeAlias
 
 import torch
 
-from sglang_omni.models.moss_tts.audio_tokenizer import resolve_moss_audio_dtype
+from sglang_omni.models.moss_tts.audio_tokenizer import (
+    DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
+    load_moss_audio_encoder,
+    load_moss_audio_vocoder,
+    resolve_moss_audio_dtype,
+)
 from sglang_omni.models.moss_tts.hf_loading import (
     load_moss_processor_class,
     moss_transformers_processor_compat,
 )
 from sglang_omni.models.moss_tts.request_builders import _DATA_URI_RE
-from sglang_omni.models.moss_tts_local.audio_tokenizer import (
-    DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
-    load_moss_tts_local_audio_tokenizer,
-    load_moss_tts_local_audio_vocoder,
-)
 from sglang_omni.models.moss_tts_local.config import resolve_vocoder_cuda_graph
 from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
@@ -203,22 +203,6 @@ def _normalize_processor_config(processor: Any) -> None:
             setattr(model_config, attr, default)
 
 
-def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
-    """Pick the codec GPU for the preprocessing/vocoder stages.
-
-    The ~1B-param codec encoder costs ~0.25 GPU-seconds per reference, which
-    at concurrency 16 starves the AR engine when both share one device.
-    The default config passes an explicit ``device`` so the second-GPU codec
-    placement is visible in the pipeline config. ``gpu_id`` remains a fallback
-    for custom colocated configs and launcher-injected runtime defaults.
-    """
-    if device:
-        return device
-    if gpu_id is not None:
-        return f"cuda:{int(gpu_id)}"
-    return "cuda:0"
-
-
 def _load_moss_tts_local_processor(model_path: str) -> Any:
     logger.info(f"Loading MOSS-TTS Local processor from {model_path} without codec")
     try:
@@ -288,6 +272,11 @@ class _BatchedReferenceEncoder:
         max_batch_wait_ms: int = 4,
     ) -> None:
         self._audio_tokenizer = audio_tokenizer
+        self._stream = None
+        device = torch.device(audio_tokenizer.device)
+        if device.type == "cuda":
+            self._stream = torch.cuda.Stream(device=device)
+            self._stream.wait_stream(torch.cuda.current_stream(device))
         self._n_vq = int(n_vq)
         self._max_batch_size = max(int(max_batch_size), 1)
         self._max_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
@@ -369,7 +358,8 @@ class _BatchedReferenceEncoder:
     def _worker(self) -> None:
         while True:
             batch = self._drain_batch()
-            results = self._encode_batch(batch)
+            with torch.cuda.stream(self._stream):
+                results = self._encode_batch(batch)
             for index, (_, future) in enumerate(batch):
                 outcome = results.get(index)
                 if isinstance(outcome, Exception):
@@ -570,14 +560,16 @@ def create_preprocessing_executor(
             "off",
             "",
         )
-    device = _resolve_codec_device(device, gpu_id)
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    device = str(resolve_concrete_device(device, gpu_id))
     processor = _load_moss_tts_local_processor(model_path)
     resolved_compute_dtype = resolve_moss_audio_dtype(
         compute_dtype,
         name="compute_dtype",
         allow_none=True,
     )
-    audio_tokenizer = load_moss_tts_local_audio_tokenizer(
+    audio_tokenizer = load_moss_audio_encoder(
         _resolve_audio_tokenizer_model_path(processor, codec_model_path),
         device=device,
         compute_dtype=resolved_compute_dtype,
@@ -612,7 +604,7 @@ def create_preprocessing_executor(
 def create_sglang_tts_engine_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
@@ -665,12 +657,14 @@ def create_vocoder_executor(
     stream_chunk_frames: int = 25,
     initial_chunk_frames: int = 5,
     coalesce_floor_frames: int = 5,
-    cuda_graph: bool | None = None,
-    cuda_graph_frames: list[int] | None = None,
-    cuda_graph_min_free_gb: float = 3.0,
+    vocoder_cuda_graph: bool | None = None,
+    vocoder_cuda_graph_frames: list[int] | None = None,
+    vocoder_cuda_graph_min_free_gb: float = 3.0,
 ) -> MossTTSLocalStreamingVocoderScheduler:
-    cuda_graph = resolve_vocoder_cuda_graph(cuda_graph)
-    device = _resolve_codec_device(device, gpu_id)
+    from sglang_omni.utils.device import resolve_concrete_device
+
+    vocoder_cuda_graph = resolve_vocoder_cuda_graph(vocoder_cuda_graph)
+    device = str(resolve_concrete_device(device, gpu_id))
     processor = _load_moss_tts_local_processor(model_path)
     decoder_dtype = resolve_moss_audio_dtype(
         dtype,
@@ -683,8 +677,11 @@ def create_vocoder_executor(
         name="compute_dtype",
         allow_none=True,
     )
-    audio_vocoder = load_moss_tts_local_audio_vocoder(
-        _resolve_audio_tokenizer_model_path(processor, codec_model_path),
+    resolved_codec_path = _resolve_audio_tokenizer_model_path(
+        processor, codec_model_path
+    )
+    audio_vocoder = load_moss_audio_vocoder(
+        resolved_codec_path,
         device=device,
         decoder_dtype=decoder_dtype,
         compute_dtype=resolved_compute_dtype,
@@ -701,9 +698,9 @@ def create_vocoder_executor(
         coalesce_floor_frames=coalesce_floor_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
-        cuda_graph=cuda_graph,
-        cuda_graph_frames=cuda_graph_frames,
-        cuda_graph_min_free_gb=cuda_graph_min_free_gb,
+        vocoder_cuda_graph=vocoder_cuda_graph,
+        vocoder_cuda_graph_frames=vocoder_cuda_graph_frames,
+        vocoder_cuda_graph_min_free_gb=vocoder_cuda_graph_min_free_gb,
     )
     # Capture graphs in the factory: it runs before the process is marked ready, so serving never
     # races a half-captured graph. Same-process guarantee (each colocate/split stage warms its own).

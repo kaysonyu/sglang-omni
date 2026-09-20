@@ -116,7 +116,6 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
             f"process_total_gpu_memory_fraction="
             f"{self.process_total_gpu_memory_fraction} "
             f"codec_mem_reserve={self.memory_budget.applied_codec_mem_reserve:.3f} "
-            f"mem_fraction_static={server_args.mem_fraction_static} "
             f"profile_total_gpu_memory_fraction="
             f"{self.profile_total_gpu_memory_fraction}"
         )

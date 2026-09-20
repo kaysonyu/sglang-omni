@@ -474,6 +474,8 @@ class SGLModelRunner(ModelRunner):
         return result
 
     def _weight_update_blocked_reason(self) -> str | None:
+        if getattr(self.model, "_moss_local_score_frozen", False):
+            return "Local teacher scoring weights are frozen"
         ws = self._weight_share_config
         if ws is None:
             return None

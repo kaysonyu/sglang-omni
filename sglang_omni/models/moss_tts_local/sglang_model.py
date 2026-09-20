@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang-native MOSS-TTS Local (v1.5) model wrapper.
+"""SGLang-native MOSS-TTS Local with structured RL capture.
 
 Architecture: a 36-layer Qwen3 global backbone consumes one summed embedding
 per audio frame (text channel + 12 RVQ code channels); a 1-layer frame-local
@@ -39,6 +39,7 @@ from sglang_omni.models.moss_tts_local.local_transformer import MossTTSLocalTran
 from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
+from sglang_omni.models.moss_tts_local.rollout_trace import selected_action_logprobs
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeStatePool
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = self._normalize_config(config)
+        gpt2_cfg = getattr(self.config, "gpt2_config", None)
+        if gpt2_cfg is None:
+            raise ValueError(
+                "MOSS Local requires a converted gpt2_config artifact; run the offline converter"
+            )
         self.quant_config = quant_config
         self.hidden_size = int(self.config.hidden_size)
         self.n_vq = int(self.config.n_vq)
@@ -101,7 +107,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        gpt2_cfg = self.config.gpt2_config
         self.local_transformer = MossTTSLocalTransformer(
             hidden_size=self.hidden_size,
             num_heads=int(self._cfg_get(gpt2_cfg, "n_head", 32)),
@@ -114,6 +119,20 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         # Binary continue/stop head over the local position-0 hidden state:
         # index 0 -> audio_assistant_slot (emit a frame), 1 -> audio_end (stop).
         self.local_text_lm_head = torch.nn.Linear(self.hidden_size, 2, bias=False)
+
+        # Per-codebook audio logits heads. v1.5 checkpoints ship them tied to
+        # the audio embedding tables while newer checkpoints (e.g. the 2.0
+        # runtime layout) train them separately. Initial loading aliases heads
+        # onto the embedding rows when omitted or serialized as tied weights.
+        self.audio_lm_heads = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(
+                    self.hidden_size, int(self.config.audio_vocab_size), bias=False
+                )
+                for _ in range(self.n_vq)
+            ]
+        )
+        self._audio_heads_initialized = False
 
         max_batch_size = None
         try:
@@ -231,6 +250,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         weight = self.embedding_list[channel + 1].weight
         return weight[: int(self.config.audio_vocab_size)]
 
+    def _audio_head_weight(self, channel: int) -> torch.Tensor:
+        """Independent RVQ output projection for one local depth."""
+
+        return self.audio_lm_heads[channel].weight
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._prepare_multi_modal_inputs(input_ids)
 
@@ -316,6 +340,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         if not self.pp_group.is_last_rank:
             return hidden_states
+
+        if getattr(self, "_moss_local_score_only", False):
+            return LogitsProcessorOutput(
+                next_token_logits=hidden_states.new_zeros(
+                    (len(forward_batch.extend_seq_lens_cpu), 1)
+                ),
+                hidden_states=hidden_states,
+            )
 
         sample_hidden_states = self._select_sample_hidden_states(
             hidden_states,
@@ -416,7 +448,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         audio_top_k: torch.Tensor,
         seeds: torch.Tensor,
         base_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Branchless frame decode used both eagerly and under graph capture.
 
         ``base_positions`` is ``generation_steps * (n_vq + 1)``; channel
@@ -425,11 +463,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         Repetition penalty is not supported here (the runner falls back to
         the eager path when a request enables it).
 
-        Returns ``(stop_choice, codes, feedback_embeds)`` where
+        Returns ``(stop_choice, codes, feedback_embeds, decision_logprobs,
+        code_logprobs)`` where
         ``feedback_embeds`` is the next backbone input embedding for a
         continuing row — the assistant-slot text embedding plus all 12 code
         embeddings, summed in the same channel order as
-        ``_prepare_multi_modal_inputs``.
+        ``_prepare_multi_modal_inputs``.  The selected-action logprobs are
+        captured in the same graph so structured RL rollouts do not have to
+        fall back to the roughly 500-launch eager frame decoder.
         """
         local_hidden = self.local_transformer.step(
             hidden_states.to(dtype=self.dtype), 0
@@ -443,15 +484,19 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             seeds=seeds,
             positions=base_positions,
         )
+        decision_logprobs = selected_action_logprobs(
+            text_logits, stop_choice, text_temperature
+        )
 
         slot_ids = torch.full_like(
             seeds, int(self.config.audio_assistant_slot_token_id)
         )
         feedback = self.embedding_list[0](slot_ids)
         codes = []
+        code_logprobs = []
         current = local_hidden
         for channel in range(self.n_vq):
-            head_weight = self._audio_embedding_weight(channel)
+            head_weight = self._audio_head_weight(channel)
             logits = F.linear(current, head_weight).float()
             code = self._sample_seeded_branchless(
                 logits,
@@ -462,13 +507,22 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 positions=base_positions + channel + 1,
             )
             codes.append(code)
-            code_embed = F.embedding(code, head_weight)
+            code_logprobs.append(
+                selected_action_logprobs(logits, code, audio_temperature)
+            )
+            code_embed = F.embedding(code, self._audio_embedding_weight(channel))
             feedback = feedback + code_embed
             if channel + 1 < self.n_vq:
                 current = self.local_transformer.step(
                     code_embed.to(dtype=self.dtype), channel + 1
                 )
-        return stop_choice, torch.stack(codes, dim=-1), feedback
+        return (
+            stop_choice,
+            torch.stack(codes, dim=-1),
+            feedback,
+            decision_logprobs.to(torch.float32),
+            torch.stack(code_logprobs, dim=-1).to(torch.float32),
+        )
 
     @torch.no_grad()
     def init_frame_decode_graphs(self, batch_sizes: list[int]) -> None:
@@ -496,7 +550,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._frame_graphs: dict[
             int,
             tuple[
-                Any, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
+                Any,
+                dict[str, torch.Tensor],
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
             ],
         ] = {}
 
@@ -532,13 +592,21 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                stop_choice, codes, feedback = frame_decode(**static_inputs)
+                (
+                    stop_choice,
+                    codes,
+                    feedback,
+                    decision_logprobs,
+                    code_logprobs,
+                ) = frame_decode(**static_inputs)
             self._frame_graphs[bucket] = (
                 graph,
                 static_inputs,
                 stop_choice,
                 codes,
                 feedback,
+                decision_logprobs,
+                code_logprobs,
             )
         logger.info(
             f"MOSS-TTS Local frame-decode CUDA graphs captured for bs={buckets}"
@@ -562,7 +630,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         audio_top_k: torch.Tensor,
         seeds: torch.Tensor,
         base_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Replay the captured frame decode for this batch (padded up to the
         nearest bucket; padding rows sample garbage that the caller discards).
 
@@ -572,7 +641,15 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         """
         batch_size = hidden_states.shape[0]
         bucket = min(b for b in self._frame_graphs if b >= batch_size)
-        graph, static_inputs, stop_choice, codes, feedback = self._frame_graphs[bucket]
+        (
+            graph,
+            static_inputs,
+            stop_choice,
+            codes,
+            feedback,
+            decision_logprobs,
+            code_logprobs,
+        ) = self._frame_graphs[bucket]
 
         static_inputs["hidden_states"][:batch_size].copy_(
             hidden_states.to(dtype=self.dtype)
@@ -594,6 +671,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             if batch_size < bucket:
                 buf[batch_size:].fill_(1 if buf.dtype.is_floating_point else 1)
         graph.replay()
+        if return_logprobs:
+            return (
+                stop_choice[:batch_size],
+                codes[:batch_size],
+                feedback[:batch_size],
+                decision_logprobs[:batch_size],
+                code_logprobs[:batch_size],
+            )
         return stop_choice[:batch_size], codes[:batch_size], feedback[:batch_size]
 
     @torch.no_grad()
@@ -628,16 +713,89 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         codes = []
         current = local_hidden
         for channel in range(self.n_vq):
-            head_weight = self._audio_embedding_weight(channel)
+            head_weight = self._audio_head_weight(channel)
             logits = F.linear(current, head_weight)
             code = sample_audio(logits.float(), channel)
             codes.append(code)
             if channel + 1 < self.n_vq:
-                next_embed = F.embedding(code, head_weight)
+                next_embed = F.embedding(code, self._audio_embedding_weight(channel))
                 current = self.local_transformer.step(
                     next_embed.to(dtype=self.dtype), channel + 1
                 )
         return stop_choice, torch.stack(codes, dim=-1)
+
+    @torch.no_grad()
+    def decode_frame_with_logprobs(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        sample_text: Callable[[torch.Tensor], torch.Tensor],
+        sample_audio: Callable[[torch.Tensor, int], torch.Tensor],
+        text_temperature: torch.Tensor,
+        audio_temperature: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Eager RL path returning selected full-vocabulary behavior logprobs.
+
+        The request builder restricts this path to positive-temperature,
+        unfiltered sampling.  If top-p/top-k/repetition filters are enabled in
+        the future, this method must gather from the sampler's filtered and
+        renormalized distribution instead.
+        """
+
+        from sglang_omni.models.moss_tts_local.rollout_trace import (
+            selected_action_logprobs,
+        )
+
+        local_hidden = self.local_transformer.step(
+            hidden_states.to(dtype=self.dtype), 0
+        )
+        text_logits = F.linear(local_hidden, self.local_text_lm_head.weight).float()
+        stop_choice = sample_text(text_logits)
+        decision_logprobs = selected_action_logprobs(
+            text_logits, stop_choice, text_temperature
+        )
+
+        codes = []
+        code_logprobs = []
+        current = local_hidden
+        for channel in range(self.n_vq):
+            head_weight = self._audio_head_weight(channel)
+            logits = F.linear(current, head_weight).float()
+            code = sample_audio(logits, channel)
+            selected = selected_action_logprobs(logits, code, audio_temperature)
+            codes.append(code)
+            code_logprobs.append(selected)
+            if channel + 1 < self.n_vq:
+                next_embed = F.embedding(code, self._audio_embedding_weight(channel))
+                current = self.local_transformer.step(
+                    next_embed.to(dtype=self.dtype), channel + 1
+                )
+        return (
+            stop_choice,
+            torch.stack(codes, dim=-1),
+            decision_logprobs.to(torch.float32),
+            torch.stack(code_logprobs, dim=-1).to(torch.float32),
+        )
+
+    def rollout_model_info(self) -> dict[str, Any]:
+        from sglang_omni.models.moss_tts_local.rollout_trace import (
+            MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,
+            MOSS_TTS_LOCAL_ROLLOUT_VERSION,
+            moss_tts_local_model_identity,
+        )
+
+        return {
+            "teacher_weight_sha256": getattr(self, "_moss_teacher_weight_sha256", None),
+            "supports_action_scoring": bool(
+                getattr(self, "_moss_local_score_only", False)
+            ),
+            "supports_weight_update": not bool(
+                getattr(self, "_moss_local_score_frozen", False)
+            ),
+            "model_identity": moss_tts_local_model_identity(self.config),
+            "rollout_schema_versions": [MOSS_TTS_LOCAL_ROLLOUT_VERSION],
+            "logprob_semantics": MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,
+        }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
@@ -648,9 +806,17 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        audio_head_weights: dict[int, torch.Tensor] = {}
+        audio_embedding_weights: dict[int, torch.Tensor] = {}
 
         for original_name, loaded_weight in weights:
             name = original_name
+            if name.startswith(
+                ("local_transformer.layers.", "local_transformer.final_layer_norm.")
+            ):
+                raise ValueError(
+                    "Unconverted Local weights: run the offline HF-to-Local converter"
+                )
             if name.startswith("transformer."):
                 name = "model." + name[len("transformer.") :]
 
@@ -667,24 +833,25 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Tied heads: the checkpoint may carry text_lm_head /
-            # audio_lm_heads tensors that alias embed_tokens /
-            # audio_embeddings; the embedding tables are authoritative here.
-            if name.startswith("text_lm_head.") or name.startswith("audio_lm_heads."):
+            # Tied head: the checkpoint may carry a text_lm_head tensor that
+            # aliases embed_tokens; the embedding table is authoritative here.
+            if name.startswith("text_lm_head."):
+                continue
+
+            if name.startswith("audio_lm_heads.") and name.endswith(".weight"):
+                param = params_dict.get(name)
+                if param is not None:
+                    audio_head_weights[int(name.split(".")[1])] = loaded_weight
+                else:
+                    logger.warning(
+                        f"MOSS-TTS Local parameter {original_name} not found"
+                    )
                 continue
 
             if name.startswith("audio_embeddings.") and name.endswith(".weight"):
                 mapped = self._map_audio_embedding_name(name)
                 if mapped is not None and mapped in params_dict:
-                    # The checkpoint table has audio_vocab_size rows while the
-                    # module reserves an extra (zeroed) pad row, so copy the
-                    # real rows directly instead of using the vocab loader.
-                    param = params_dict[mapped]
-                    rows = int(loaded_weight.shape[0])
-                    with torch.no_grad():
-                        param.data[:rows].copy_(
-                            loaded_weight.to(device=param.device, dtype=param.dtype)
-                        )
+                    audio_embedding_weights[int(name.split(".")[1])] = loaded_weight
                 continue
 
             if name.startswith("local_transformer.") or name.startswith(
@@ -731,7 +898,92 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             else:
                 logger.warning(f"MOSS-TTS Local parameter {original_name} not found")
 
+        audio_storage_changed = self._load_audio_weights(
+            audio_embedding_weights, audio_head_weights
+        )
+        if not self._audio_heads_initialized:
+            audio_storage_changed |= self._resolve_audio_head_ties(
+                set(audio_head_weights)
+            )
+            self._audio_heads_initialized = True
         self._zero_audio_pad_rows()
+
+        if audio_storage_changed and getattr(self, "_frame_graphs", None):
+            # note (Zhang Yiyang): Frame graphs retain the old weight addresses.
+            batch_sizes = list(self._frame_graphs)
+            self._frame_graphs.clear()
+            self.init_frame_decode_graphs(batch_sizes)
+
+    @torch.no_grad()
+    def _load_audio_weights(
+        self,
+        embeddings: dict[int, torch.Tensor],
+        heads: dict[int, torch.Tensor],
+    ) -> bool:
+        """Load audio tables together, splitting aliases before either write."""
+        storage_changed = False
+        for channel in range(self.n_vq):
+            embedding_weight = embeddings.get(channel)
+            head_weight = heads.get(channel)
+            if embedding_weight is None and head_weight is None:
+                continue
+            embedding = self._audio_embedding_weight(channel)
+            head = self.audio_lm_heads[channel].weight
+            if embedding_weight is not None:
+                embedding_weight = embedding_weight.to(
+                    device=embedding.device, dtype=embedding.dtype
+                )
+            if head_weight is not None and head.data_ptr() == embedding.data_ptr():
+                head_weight = head_weight.to(device=head.device, dtype=head.dtype)
+                target_embedding = (
+                    embedding
+                    if embedding_weight is None
+                    else embedding_weight[: embedding.shape[0]]
+                )
+                if not torch.equal(head_weight, target_embedding):
+                    head.data = head.data.clone()
+                    storage_changed = True
+            if embedding_weight is not None:
+                param = self.embedding_list[channel + 1].weight
+                param.data[: embedding_weight.shape[0]].copy_(embedding_weight)
+            if head_weight is not None:
+                self._load_param(head, head_weight)
+        return storage_changed
+
+    def _resolve_audio_head_ties(self, loaded: set[int]) -> bool:
+        """Resolve initial checkpoint ties and report changed storage."""
+        missing = [c for c in range(self.n_vq) if c not in loaded]
+        if missing and loaded:
+            raise ValueError(
+                f"MOSS-TTS Local checkpoint carries audio_lm_heads for only "
+                f"{sorted(loaded)} of {self.n_vq} codebooks; untied heads must "
+                f"be complete"
+            )
+        if not missing:
+            tied = all(
+                torch.equal(
+                    self.audio_lm_heads[channel].weight,
+                    self._audio_embedding_weight(channel),
+                )
+                for channel in loaded
+            )
+            if not tied:
+                return False
+            logger.info(
+                "MOSS-TTS Local audio_lm_heads match the audio embeddings; "
+                "aliased onto the embedding tables"
+            )
+        else:
+            logger.info(
+                "MOSS-TTS Local checkpoint has no audio_lm_heads; "
+                "tied logits heads onto the audio embedding tables"
+            )
+        channels = missing if missing else range(self.n_vq)
+        for channel in channels:
+            self.audio_lm_heads[channel].weight.data = self._audio_embedding_weight(
+                channel
+            )
+        return True
 
     def _zero_audio_pad_rows(self) -> None:
         """Zero rows >= audio_vocab_size so pad codes embed to exactly zero."""
@@ -762,7 +1014,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         embed_weights = [
             getattr(layer, "weight", None) for layer in self.embedding_list
         ]
-        return embed_weights, [self.local_text_lm_head.weight]
+        head_weights = [
+            self.local_text_lm_head.weight,
+            *(head.weight for head in self.audio_lm_heads),
+        ]
+        return embed_weights, head_weights
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

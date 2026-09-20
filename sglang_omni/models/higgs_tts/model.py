@@ -437,6 +437,16 @@ class HiggsTTSModel(nn.Module):
         at ``-100``); decode reads embeds and sampling state from
         ``_cg_active_*`` shadow buffers populated by the runner.
         """
+        if getattr(self, "_higgs_score_only", False):
+            if input_embeds is None:
+                raise ValueError("Higgs scoring requires supplied replay embeddings")
+            hidden = self.backbone.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=hidden.new_zeros((forward_batch.batch_size, 1)),
+                hidden_states=hidden,
+            )
         is_decode = self._is_decode_step(forward_batch)
 
         if is_decode:
@@ -555,6 +565,17 @@ class HiggsTTSModel(nn.Module):
         if seq_lens is not None and hasattr(seq_lens, "shape"):
             return int(seq_lens.shape[0])
         return int(getattr(forward_batch, "batch_size", 1))
+
+    def rollout_model_info(self):
+        from sglang_omni.models.higgs_tts.rl_contract import model_identity
+
+        return {
+            "model_identity": model_identity(),
+            "rollout_schema_versions": [1, 2],
+            "logprob_semantics": "temperature_scaled_full_vocab_v1",
+            "supports_action_scoring": bool(getattr(self, "_higgs_score_only", False)),
+            "supports_weight_update": not bool(getattr(self, "_higgs_score_only", False)),
+        }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         """Remap Higgs ckpt names then split between backbone and own modules.

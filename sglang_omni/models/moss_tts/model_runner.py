@@ -620,22 +620,31 @@ class MossTTSModelRunner(ModelRunner):
             return candidate_token_ids[sampled].to(torch.long)
 
         sample_mask = ~fallback
-        if bool(sample_mask.any()):
-            if device.type == "cpu":
+        if device.type == "cpu":
+            if bool(sample_mask.any()):
                 sampled[sample_mask] = MossTTSModelRunner._multinomial_with_seed_cpu(
                     probs[sample_mask],
                     seeds_row[sample_mask],
                     positions_row[sample_mask],
                 )
-            else:
-                # Note:(Chenchen Hong) post1's multinomial_with_seed is Gumbel-max
-                # and wants logits, not probs (probs lost the -inf masking and made
-                # MOSS emit only the pad code); the CPU fallback still needs probs.
-                sampled[sample_mask] = multinomial_with_seed(
-                    scores[sample_mask],
-                    seeds_row[sample_mask],
-                    positions_row[sample_mask],
-                ).view(-1)
+        else:
+            # Keep the CUDA path branchless. ``bool(sample_mask.any())`` and
+            # boolean indexing both synchronize the device once per channel;
+            # MOSS-TTS Local invokes this sampler 13 times per generated frame.
+            # Sample every row and select the greedy fallback on-device.  The
+            # sampled value of a fallback row is unobservable, so this keeps
+            # the exact seeded semantics of every active row while removing
+            # the host round trip and DeviceSelect kernels.
+            #
+            # Note:(Chenchen Hong) post1's multinomial_with_seed is Gumbel-max
+            # and wants logits, not probs (probs lost the -inf masking and made
+            # MOSS emit only the pad code); the CPU fallback still needs probs.
+            sampled_all = multinomial_with_seed(
+                scores,
+                seeds_row,
+                positions_row,
+            ).view(-1)
+            sampled = torch.where(sample_mask, sampled_all, sampled)
         return sampled.to(torch.long)
 
     @staticmethod
