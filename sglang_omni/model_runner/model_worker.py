@@ -402,7 +402,7 @@ class ModelWorker:
     def model_info(self) -> dict[str, Any]:
         from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 
-        return {
+        info = {
             "model_path": get_model().model_path,
             "load_format": get_model().load_format,
             "weight_version": get_serving().weight_version,
@@ -413,6 +413,10 @@ class ModelWorker:
             "supports_weight_checker": True,
             "prefill_cuda_graph": self.prefill_cuda_graph_info(),
         }
+        describe = getattr(self.model_runner.model, "rollout_model_info", None)
+        if describe is not None:
+            info.update(describe())
+        return info
 
     def update_weights_from_disk(self, payload: dict[str, Any]) -> tuple[bool, str]:
         model_path = payload.get("model_path")
