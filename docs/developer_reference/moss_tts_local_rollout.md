@@ -82,3 +82,16 @@ reported with every result; no teacher-specific weight-update guards are added.
 BF16 full-prefill scoring and incremental generation can produce different
 logprobs even with the same weights. Keep the sampled behavior logprobs from
 the rollout for training ratios; teacher scores do not replace them.
+
+## Model discovery
+
+The `tts_engine` entry in `/model_info` publishes `model_identity`,
+`rollout_schema_versions`, `logprob_semantics`, `supports_action_scoring`, and
+`supports_weight_update`. RL generation and scoring instances report schema v2;
+ordinary generation instances report no enabled rollout schema.
+
+Teacher scoring instances also publish their startup `teacher_weight_sha256`
+and `weight_version`, matching each score response. They declare
+`supports_action_scoring=true` and `supports_weight_update=false` for downstream
+role discovery. This declaration relies on the caller keeping teacher weights
+fixed; it does not add enforcement to the update endpoints.

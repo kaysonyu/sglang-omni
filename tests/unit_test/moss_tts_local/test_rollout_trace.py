@@ -239,3 +239,49 @@ def test_generate_accepts_reference_conditioning():
     result = build_rollout_generate_request(request)
     assert result.prompt == conditioning
     assert result.extra_params["return_omni_rollout"] is True
+
+
+@pytest.mark.parametrize(
+    "enable_rl,score_only", [(False, False), (True, False), (False, True)]
+)
+def test_model_info_matches_serving_role(config, enable_rl, score_only):
+    from sglang.srt.runtime_context import get_context
+
+    from sglang_omni.model_runner.model_worker import ModelWorker
+    from sglang_omni.models.moss_tts_local.rollout_trace import (
+        moss_tts_local_model_identity,
+    )
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
+
+    model = SimpleNamespace(
+        config=config,
+        enable_rl=enable_rl,
+        score_only=score_only,
+        teacher_weight_sha256="a" * 64,
+        teacher_weight_version="teacher-v1",
+    )
+    model.rollout_model_info = lambda: MossTTSLocalSGLangModel.rollout_model_info(model)
+    worker = object.__new__(ModelWorker)
+    worker.model_runner = SimpleNamespace(model=model)
+    worker.tp_rank = 0
+    worker.model_arch_override = "MossTTSLocalSGLangModel"
+    worker.prefill_cuda_graph_info = lambda: {"backend": "disabled"}
+    with get_context().override_server_args(
+        model_path="test-model",
+        load_format="auto",
+        weight_version="student-v2",
+        tp_size=1,
+    ):
+        info = worker.model_info()
+    assert info["model_identity"] == moss_tts_local_model_identity(config)
+    assert info["rollout_schema_versions"] == ([2] if enable_rl or score_only else [])
+    assert info["logprob_semantics"] == "temperature_scaled_full_vocab_v1"
+    assert info["supports_action_scoring"] is score_only
+    assert info["supports_weight_update"] is not score_only
+    assert info["supports_weight_checker"] is True
+    assert info["weight_version"] == ("teacher-v1" if score_only else "student-v2")
+    assert info["prefill_cuda_graph"] == {"backend": "disabled"}
+    if score_only:
+        assert info["teacher_weight_sha256"] == "a" * 64
+    else:
+        assert "teacher_weight_sha256" not in info

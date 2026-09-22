@@ -57,7 +57,12 @@ def as_qwen3_config(config: Any) -> Any:
     return config
 
 
-from sglang_omni.models.moss_tts_local.rollout_trace import selected_action_logprobs
+from sglang_omni.models.moss_tts_local.rollout_trace import (
+    MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,
+    MOSS_TTS_LOCAL_ROLLOUT_VERSION,
+    moss_tts_local_model_identity,
+    selected_action_logprobs,
+)
 
 
 class MossTTSLocalSGLangModel(torch.nn.Module):
@@ -72,6 +77,25 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
     score_only = False
     teacher_weight_sha256: str | None = None
     teacher_weight_version: str | None = None
+
+    def rollout_model_info(self) -> dict[str, Any]:
+        info = {
+            "model_identity": moss_tts_local_model_identity(self.config),
+            "rollout_schema_versions": (
+                [MOSS_TTS_LOCAL_ROLLOUT_VERSION]
+                if self.enable_rl or self.score_only
+                else []
+            ),
+            "logprob_semantics": MOSS_TTS_LOCAL_LOGPROB_SEMANTICS,
+            "supports_action_scoring": self.score_only,
+            "supports_weight_update": not self.score_only,
+        }
+        if self.score_only:
+            info.update(
+                teacher_weight_sha256=self.teacher_weight_sha256,
+                weight_version=self.teacher_weight_version,
+            )
+        return info
 
     def __init__(
         self,
