@@ -281,9 +281,36 @@ class MossTTSLocalSplitPipelineConfig(MossTTSLocalPipelineConfig):
     )
 
 
+class MossTTSLocalScorePipelineConfig(PipelineConfig):
+    """Teacher scoring without reference encoding or audio synthesis."""
+
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "tts_engine": EngineStageConfig,
+    }
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: [
+            EngineStageConfig(
+                name="tts_engine",
+                process="teacher",
+                gpu=0,
+                gpu_memory_fraction=0.5,
+                terminal=True,
+                factory_path=f"{_PKG}.scoring.create_score_engine",
+                factory=FactoryArgs(dtype="bfloat16", score_chunk_size=128),
+                engine=EngineArgs(
+                    disable_cuda_graph=True,
+                    disable_radix_cache=True,
+                    chunked_prefill_size=-1,
+                ),
+            )
+        ]
+    )
+
+
 EntryClass = MossTTSLocalPipelineConfig
 
 Variants = {
+    "score": MossTTSLocalScorePipelineConfig,
     "default": MossTTSLocalPipelineConfig,
     "colocated": MossTTSLocalColocatedPipelineConfig,
     "split": MossTTSLocalSplitPipelineConfig,

@@ -70,6 +70,9 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
     }
 
     enable_rl = False
+    score_only = False
+    teacher_weight_sha256: str | None = None
+    teacher_weight_version: str | None = None
 
     def __init__(
         self,
@@ -339,9 +342,10 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
-        sample_hidden_states = self.select_sample_hidden_states(
-            hidden_states,
-            forward_batch,
+        sample_hidden_states = (
+            hidden_states
+            if self.score_only
+            else self.select_sample_hidden_states(hidden_states, forward_batch)
         )
         # The local-transformer frame decode (binary stop head + 12 sequential
         # codebook samples) runs in the model runner after the graph-captured
