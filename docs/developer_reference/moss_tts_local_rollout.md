@@ -40,3 +40,45 @@ at the client boundary, avoiding recursive tensor routing over each scalar.
 RL still adds probability computation, retained tensors, and serialization.
 Graph outputs and probability buffers are rebuilt with frame graphs when
 weight storage changes.
+
+## Teacher scoring
+
+Use `examples/configs/moss_tts_local_score.yaml` for a separate teacher service.
+Set its `model_path` to the converted checkpoint used by the teacher, then run:
+
+```bash
+python -m sglang_omni.cli serve --config examples/configs/moss_tts_local_score.yaml
+```
+
+`POST /score_actions` accepts `{"samples": [...]}`. Build each sample from the
+original rollout:
+
+```python
+sample = {
+    "version": 1,
+    "sample_id": "sample-1",
+    "prompt_rows": rollout["replay_inputs"]["prompt_rows"],
+    "decisions": rollout["action_streams"][0]["actions"],
+    "codes": rollout["action_streams"][1]["actions"],
+    "temperature": 1.0,
+}
+```
+
+The response is `{"version": 1, "results": [...]}` in input order, with selected
+`decision_logprobs` and `code_logprobs`, `sample_id`, `input_sha256`,
+`teacher_weight_sha256`, `weight_version`, `model_identity`, and
+`logprob_semantics`. The input hash covers canonical validated input excluding
+`sample_id`. A single positive temperature applies to both action streams.
+A batch accepts up to 64 samples; the scheduler may process them in separate
+prefill batches. `scoring_batch_sha256` identifies the actual prefill batch.
+Model vocabulary, channel counts and context limits come from the loaded model.
+
+The teacher uses unchunked global prefill without prefix reuse and scores Local
+frames in bounded batches (`tts_engine.factory.score_chunk_size`, default 128).
+It does not load the audio tokenizer or vocoder. The caller keeps teacher weights
+fixed for the service lifetime. Its startup version and parameter checksum are
+reported with every result; no teacher-specific weight-update guards are added.
+
+BF16 full-prefill scoring and incremental generation can produce different
+logprobs even with the same weights. Keep the sampled behavior logprobs from
+the rollout for training ratios; teacher scores do not replace them.

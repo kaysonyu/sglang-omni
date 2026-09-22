@@ -71,6 +71,7 @@ from sglang_omni.http.favicon import register_favicon
 from sglang_omni.serve.generation_params import (
     record_explicit_generation_params as _record_explicit_generation_params,
 )
+from sglang_omni.serve.local_scoring import register_local_scoring
 from sglang_omni.serve.openai_errors import (
     is_bad_request_error as _is_bad_request_error,
 )
@@ -300,6 +301,7 @@ def create_app(
     register_chat_completions(app)
     register_voices(app)
     register_generate(app)
+    register_local_scoring(app)
     register_speech(app)
     register_speech_batch(app)
     register_speech_ws(app)
