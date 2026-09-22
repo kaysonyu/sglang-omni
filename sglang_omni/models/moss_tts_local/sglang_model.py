@@ -249,7 +249,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         weight = self.embedding_list[channel + 1].weight
         return weight[: int(self.config.audio_vocab_size)]
 
-    def _audio_head_weight(self, channel: int) -> torch.Tensor:
+    def audio_head_weight(self, channel: int) -> torch.Tensor:
         """Logits head for codebook ``channel`` (``audio_lm_heads`` table)."""
         return self.audio_lm_heads[channel].weight
 
@@ -473,7 +473,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         codes = []
         current = local_hidden
         for channel in range(self.n_vq):
-            logits = F.linear(current, self._audio_head_weight(channel)).float()
+            logits = F.linear(current, self.audio_head_weight(channel)).float()
             code = self._sample_seeded_branchless(
                 logits,
                 temperature=audio_temperature,
@@ -649,7 +649,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         codes = []
         current = local_hidden
         for channel in range(self.n_vq):
-            logits = F.linear(current, self._audio_head_weight(channel))
+            logits = F.linear(current, self.audio_head_weight(channel))
             code = sample_audio(logits.float(), channel)
             codes.append(code)
             if channel + 1 < self.n_vq:
@@ -754,11 +754,11 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             else:
                 logger.warning(f"MOSS-TTS Local parameter {original_name} not found")
 
-        audio_storage_changed = self._load_audio_weights(
+        audio_storage_changed = self.load_audio_weights(
             audio_embedding_weights, audio_head_weights
         )
         if not self._audio_heads_initialized:
-            audio_storage_changed |= self._resolve_audio_head_ties(
+            audio_storage_changed |= self.resolve_audio_head_ties(
                 set(audio_head_weights)
             )
             self._audio_heads_initialized = True
@@ -771,7 +771,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             self.init_frame_decode_graphs(batch_sizes)
 
     @torch.no_grad()
-    def _load_audio_weights(
+    def load_audio_weights(
         self,
         embeddings: dict[int, torch.Tensor],
         heads: dict[int, torch.Tensor],
@@ -806,7 +806,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 self.load_param(head, head_weight)
         return storage_changed
 
-    def _resolve_audio_head_ties(self, loaded: set[int]) -> bool:
+    def resolve_audio_head_ties(self, loaded: set[int]) -> bool:
         """Resolve initial checkpoint ties and report changed storage."""
         missing = [c for c in range(self.n_vq) if c not in loaded]
         if missing and loaded:
