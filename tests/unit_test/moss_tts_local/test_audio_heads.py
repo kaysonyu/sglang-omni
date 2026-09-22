@@ -84,6 +84,7 @@ def _model_stub() -> SimpleNamespace:
         _audio_heads_initialized=False,
         dtype=torch.float32,
         embedding_list=embedding_list,
+        enable_rl=False,
         audio_lm_heads=[_linear(_AUDIO_VOCAB, seed=300 + c) for c in range(_N_VQ)],
         local_text_lm_head=_linear(2, seed=400),
         local_transformer=SimpleNamespace(step=lambda hidden, position: hidden * 0.5),
@@ -384,10 +385,13 @@ def test_graphable_frame_uses_same_head_embedding_split() -> None:
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("initial_tied", [False, True, None])
+@pytest.mark.parametrize("enable_rl", [False, True])
 def test_cuda_graph_replay_after_audio_weight_updates(
     initial_tied: bool | None,
+    enable_rl: bool,
 ) -> None:
     stub = _frame_stub()
+    stub.enable_rl = enable_rl
     stub.device = torch.device("cuda", torch.cuda.current_device())
     stub.dtype = torch.bfloat16
     for _, param in stub.named_parameters():
@@ -422,7 +426,99 @@ def test_cuda_graph_replay_after_audio_weight_updates(
                 stub._frame_graphs[batch][0] is not previous_graphs[batch]
             ) == storage_changed
             inputs = _frame_inputs(batch, device=stub.device, dtype=stub.dtype)
-            expected = stub.decode_frame_graphable(**inputs)
+            expected = stub.decode_frame_graphable(**inputs, return_logprobs=enable_rl)
             replayed = stub.decode_frame_graphed(**inputs)
             for actual, reference in zip(replayed, expected):
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def test_rollout_logprobs_match_selected_actions():
+    stub = _frame_stub()
+    inputs = _frame_inputs(2)
+    ordinary = stub.decode_frame_graphable(**inputs)
+    traced = stub.decode_frame_graphable(**inputs, return_logprobs=True)
+    for actual, expected in zip(traced[:3], ordinary):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    decisions, codes, _, decision_logprobs, code_logprobs = traced
+    hidden = stub.local_transformer.step(inputs["hidden_states"], 0)
+    text_logits = F.linear(hidden, stub.local_text_lm_head.weight).float()
+    expected = torch.log_softmax(text_logits / inputs["text_temperature"][:, None], -1)
+    torch.testing.assert_close(
+        decision_logprobs, expected.gather(1, decisions[:, None]).squeeze(1)
+    )
+    for channel in range(stub.n_vq):
+        logits = F.linear(hidden, stub.audio_head_weight(channel)).float()
+        expected = torch.log_softmax(logits / inputs["audio_temperature"][:, None], -1)
+        torch.testing.assert_close(
+            code_logprobs[:, channel],
+            expected.gather(1, codes[:, channel, None]).squeeze(1),
+        )
+        if channel + 1 < stub.n_vq:
+            hidden = stub.local_transformer.step(
+                F.embedding(codes[:, channel], stub.audio_embedding_weight(channel)),
+                channel + 1,
+            )
+
+
+def test_ordinary_frame_skips_logprob_calculation(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("ordinary decode must not compute rollout logprobs")
+
+    monkeypatch.setattr(
+        "sglang_omni.models.moss_tts_local.sglang_model.selected_action_logprobs",
+        unexpected,
+    )
+    stub = _frame_stub()
+    assert len(stub.decode_frame_graphable(**_frame_inputs(2))) == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rl_graph_replays_request_sampling_parameters():
+    from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_fused
+
+    stub = _frame_stub()
+    stub.enable_rl = True
+    stub.device = torch.device("cuda", torch.cuda.current_device())
+    stub.dtype = torch.bfloat16
+    for _, param in stub.named_parameters():
+        param.data = param.data.to(device=stub.device, dtype=stub.dtype)
+    stub._decode_input_embedding = SimpleNamespace(weight=torch.empty(2, _HIDDEN))
+    stub.local_transformer.ensure_kv_cache = lambda *args: None
+    stub.local_transformer.freeze_kv_cache = lambda: None
+    stub.ensure_frame_sampler_compile = lambda: None
+    stub._sample_seeded_branchless = sample_seeded_fused
+    _bind(stub, "init_frame_decode_graphs", "decode_frame_graphed")
+    stub.init_frame_decode_graphs([2])
+    graph = stub._frame_graphs[2][0]
+
+    for step, batch in enumerate((2, 1, 2)):
+        inputs = _frame_inputs(batch, device=stub.device, dtype=stub.dtype)
+        inputs["text_temperature"].copy_(
+            torch.linspace(0.6 + step, 1.2 + step, batch, device=stub.device)
+        )
+        inputs["audio_temperature"].copy_(
+            torch.linspace(0.8 + step, 1.4 + step, batch, device=stub.device)
+        )
+        inputs["text_top_k"].fill_(-1)
+        inputs["audio_top_k"].fill_(-1)
+        inputs["seeds"].copy_(torch.arange(batch, device=stub.device) + 42 + step)
+        inputs["base_positions"].fill_(step * (_N_VQ + 1))
+        expected = stub.decode_frame_graphable(**inputs, return_logprobs=True)
+        actual = stub.decode_frame_graphed(**inputs)
+        assert stub._frame_graphs[2][0] is graph
+        assert len(actual) == len(expected) == 5
+        for reference, replayed in zip(expected, actual):
+            torch.testing.assert_close(replayed, reference, rtol=0, atol=0)
+        for name in (
+            "text_temperature",
+            "audio_temperature",
+            "text_top_k",
+            "audio_top_k",
+            "text_top_p",
+            "audio_top_p",
+            "seeds",
+            "base_positions",
+        ):
+            torch.testing.assert_close(
+                stub._frame_graphs[2][1][name][:batch], inputs[name], rtol=0, atol=0
+            )

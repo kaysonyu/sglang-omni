@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import partial
 from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
@@ -56,6 +57,9 @@ def as_qwen3_config(config: Any) -> Any:
     return config
 
 
+from sglang_omni.models.moss_tts_local.rollout_trace import selected_action_logprobs
+
+
 class MossTTSLocalSGLangModel(torch.nn.Module):
     """MOSS-TTS Local AR model: Qwen3 backbone + 1-layer local transformer."""
 
@@ -63,6 +67,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    enable_rl = False
 
     def __init__(
         self,
@@ -438,7 +444,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         audio_top_k: torch.Tensor,
         seeds: torch.Tensor,
         base_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Branchless frame decode used both eagerly and under graph capture.
 
         ``base_positions`` is ``generation_steps * (n_vq + 1)``; channel
@@ -466,6 +473,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             positions=base_positions,
         )
 
+        decision_logprobs = (
+            selected_action_logprobs(text_logits, stop_choice, text_temperature)
+            if return_logprobs
+            else None
+        )
+        code_logprobs = []
+
         slot_ids = torch.full_like(
             seeds, int(self.config.audio_assistant_slot_token_id)
         )
@@ -483,13 +497,20 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 positions=base_positions + channel + 1,
             )
             codes.append(code)
+            if return_logprobs:
+                code_logprobs.append(
+                    selected_action_logprobs(logits, code, audio_temperature)
+                )
             code_embed = F.embedding(code, self.audio_embedding_weight(channel))
             feedback = feedback + code_embed
             if channel + 1 < self.n_vq:
                 current = self.local_transformer.step(
                     code_embed.to(dtype=self.dtype), channel + 1
                 )
-        return stop_choice, torch.stack(codes, dim=-1), feedback
+        outputs = (stop_choice, torch.stack(codes, dim=-1), feedback)
+        if return_logprobs:
+            return (*outputs, decision_logprobs, torch.stack(code_logprobs, dim=-1))
+        return outputs
 
     @torch.no_grad()
     def init_frame_decode_graphs(self, batch_sizes: list[int]) -> None:
@@ -513,13 +534,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         self.local_transformer.freeze_kv_cache()
         self.ensure_frame_sampler_compile()
-        frame_decode = self.decode_frame_graphable
-        self._frame_graphs: dict[
-            int,
-            tuple[
-                Any, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
-            ],
-        ] = {}
+        self._frame_graphs = {}
+        graphs = self._frame_graphs
+        frame_decode = (
+            partial(self.decode_frame_graphable, return_logprobs=True)
+            if self.enable_rl
+            else self.decode_frame_graphable
+        )
 
         for bucket in buckets:
             static_inputs = {
@@ -553,14 +574,8 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                stop_choice, codes, feedback = frame_decode(**static_inputs)
-            self._frame_graphs[bucket] = (
-                graph,
-                static_inputs,
-                stop_choice,
-                codes,
-                feedback,
-            )
+                outputs = frame_decode(**static_inputs)
+            graphs[bucket] = (graph, static_inputs, *outputs)
         logger.info(
             f"MOSS-TTS Local frame-decode CUDA graphs captured for bs={buckets}"
         )
@@ -583,7 +598,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         audio_top_k: torch.Tensor,
         seeds: torch.Tensor,
         base_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """Replay the captured frame decode for this batch (padded up to the
         nearest bucket; padding rows sample garbage that the caller discards).
 
@@ -593,7 +608,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         """
         batch_size = hidden_states.shape[0]
         bucket = min(b for b in self._frame_graphs if b >= batch_size)
-        graph, static_inputs, stop_choice, codes, feedback = self._frame_graphs[bucket]
+        graph, static_inputs, *outputs = self._frame_graphs[bucket]
 
         static_inputs["hidden_states"][:batch_size].copy_(
             hidden_states.to(dtype=self.dtype)
@@ -615,7 +630,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             if batch_size < bucket:
                 buf[batch_size:].fill_(1 if buf.dtype.is_floating_point else 1)
         graph.replay()
-        return stop_choice[:batch_size], codes[:batch_size], feedback[:batch_size]
+        return tuple(output[:batch_size] for output in outputs)
 
     @torch.no_grad()
     def decode_frame(
