@@ -165,6 +165,7 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     vocoder_cuda_graph: bool | None = None
     vocoder_cuda_graph_frames: list[int] | None = None
     vocoder_cuda_graph_min_free_gb: float = 3.0
+    enable_rl: bool = False
     ref_audio_cache: bool = True
     ref_audio_cache_max_items: int = _REF_AUDIO_CACHE_MAX_ITEMS
     ref_audio_cache_max_bytes: int = _REF_AUDIO_CACHE_MAX_BYTES
@@ -181,8 +182,11 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
             if engine_stage.gpu_memory_fraction is not None:
                 # Colocated layouts budget the codec reserve through the
                 # per-stage fractions instead of the engine-side reserve.
-                return {"codec_mem_reserve": 0.0}
-            return {}
+                return {
+                    "codec_mem_reserve": 0.0,
+                    **({"enable_rl": True} if self.enable_rl else {}),
+                }
+            return {"enable_rl": True} if self.enable_rl else {}
         if stage_name == "vocoder":
             return {
                 "vocoder_cuda_graph": resolve_vocoder_cuda_graph(

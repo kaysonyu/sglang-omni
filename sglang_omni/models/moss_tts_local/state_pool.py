@@ -306,7 +306,13 @@ class MossTTSLocalDecodeJournal:
         rids: list[str],
         pool_rows: list[int],
         rows: torch.Tensor,
+        decisions: torch.Tensor | None = None,
+        decision_logprobs: torch.Tensor | None = None,
+        code_logprobs: torch.Tensor | None = None,
     ) -> None:
         self.rids = rids
         self.pool_rows = pool_rows
         self.rows = rows
+        self.decisions = decisions
+        self.decision_logprobs = decision_logprobs
+        self.code_logprobs = code_logprobs

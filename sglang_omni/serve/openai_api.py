@@ -1194,7 +1194,11 @@ def build_generate_response(
         )
     audio: GenerateAudio | None = None
     if result.audio is not None:
-        audio = GenerateAudio(data=result.audio.data, format=audio_format)
+        audio = GenerateAudio(
+            data=result.audio.data,
+            format=audio_format,
+            sample_rate=result.audio.sample_rate,
+        )
 
     meta_info = GenerateMetaInfo(
         finish_reason=finish_reason,
