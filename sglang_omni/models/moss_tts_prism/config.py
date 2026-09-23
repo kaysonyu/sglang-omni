@@ -33,7 +33,7 @@ def stages() -> list[StageConfig]:
             process="pipeline",
             gpu=0,
             factory_path=f"{PKG}.stages.create_sglang_tts_engine_executor",
-            engine=EngineArgs(disable_cuda_graph=True),
+            engine=EngineArgs(disable_cuda_graph=False),
             gpu_memory_fraction=0.67,
             next="vocoder",
             stream_to=["vocoder"],

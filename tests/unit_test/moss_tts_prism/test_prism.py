@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from torch import nn
 
 from sglang_omni.models.moss_tts_prism.config import MossTTSPrismPipelineConfig
@@ -21,7 +22,7 @@ from sglang_omni.models.moss_tts_prism.request_builders import (
 from sglang_omni.models.moss_tts_prism.sglang_model import (
     MossTTSPrismSGLangModel,
     PrismBatchInputs,
-    PrismModelOutput,
+    PrismDecodeInputs,
     prism_cache_layout,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -89,7 +90,7 @@ def test_loop_residual_and_conditioning(reapply, expected):
     output = model(torch.tensor([1]), torch.tensor([0]), SimpleNamespace())
     torch.testing.assert_close(predictions[0], torch.full((1, 2), expected))
     assert visited_slots == [0, 1, 2, 3]
-    assert output.audio_codes.tolist() == [[0, 0, 0, 0]]
+    assert output.customized_info["audio_codes"].tolist() == [[0, 0, 0, 0]]
 
 
 def test_virtual_cache_slots_exclude_mlp_only_repetitions():
@@ -139,6 +140,7 @@ def embedding_model():
     model.config = SimpleNamespace(
         text_pad_idx=0, prism_input_rvq_channels=(1,), embedding_head_usage="untied"
     )
+    model.decode_inputs = None
     model.n_vq = 2
     model.transformer = nn.Module()
     model.transformer.embed_tokens = nn.Embedding.from_pretrained(
@@ -226,8 +228,8 @@ def test_stop_projection_stays_fp32_under_autocast():
     )
     with torch.autocast("cpu", dtype=torch.bfloat16):
         output = model(torch.tensor([1]), torch.tensor([0]), SimpleNamespace())
-    assert output.stop_logits.dtype == torch.float32
-    torch.testing.assert_close(output.stop_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.dtype == torch.float32
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("frames", [1, 3, 7])
@@ -247,10 +249,9 @@ def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop):
     chunks = []
     for index in range(frames):
         result = SimpleNamespace(
-            logits_output=PrismModelOutput(
-                next_token_logits=torch.zeros(1, 2),
-                audio_codes=torch.tensor([[index, index + 1]]),
-                stop_logits=(
+            logits_output=LogitsProcessorOutput(
+                customized_info={"audio_codes": torch.tensor([[index, index + 1]])},
+                next_token_logits=(
                     torch.tensor([[0.0, 1.0]])
                     if stop and index == frames - 1
                     else torch.tensor([[1.0, 0.0]])
@@ -305,10 +306,10 @@ def test_preprocess_uses_prism_prompt_fields():
     assert prepared.data["generation_kwargs"]["seed"] == 42
 
 
-def test_pipeline_registers_separate_architecture_with_eager_ar():
+def test_pipeline_registers_separate_architecture_with_decode_graphs():
     config = MossTTSPrismPipelineConfig(model_path="model")
     assert config.architecture == "MossTTSPrismModel"
-    assert config.stage_named("tts_engine").engine.disable_cuda_graph
+    assert not config.stage_named("tts_engine").engine.disable_cuda_graph
     assert config.stage_named("tts_engine").stream_to == ["vocoder"]
     assert config.stage_factory_kwargs("vocoder") == {
         "codec_model_path": config.codec_model_path
@@ -321,7 +322,7 @@ def test_pipeline_registers_separate_architecture_with_eager_ar():
         ({"tp_size": 2}, "TP=1"),
         ({"disable_radix_cache": False}, "radix cache"),
         ({"chunked_prefill_size": 512}, "chunked prefill"),
-        ({"enable_torch_compile": True}, "eager AR"),
+        ({"enable_torch_compile": True}, "without torch.compile"),
         ({"disable_overlap_schedule": False}, "synchronous"),
     ],
 )
@@ -350,7 +351,9 @@ def test_unsupported_engine_modes_fail_before_loading(monkeypatch, overrides, me
 def test_sampling_tracks_request_seed_and_history_after_batch_reordering():
     config = SimpleNamespace(text_pad_idx=0, n_vq=2, prism_input_rvq_channels=(1,))
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
-    runner.model = SimpleNamespace(config=config, n_vq=2, device=torch.device("cpu"))
+    runner.model = SimpleNamespace(
+        config=config, n_vq=2, device=torch.device("cpu"), decode_inputs=None
+    )
     requests = []
     for index, seed in enumerate((17, 42)):
         data = PrismRequestData(prompt=prompt(), sampling_seed=seed)
@@ -368,3 +371,60 @@ def test_sampling_tracks_request_seed_and_history_after_batch_reordering():
     runner.prepare(requests[::-1], prefill=False)
     second = runner.model.batch_inputs.sample(logits.flip(0).clone(), 0)
     torch.testing.assert_close(first, second.flip(0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_decode_graph_refreshes_seed_history_and_batch_rows():
+    device = torch.device("cuda")
+    config = SimpleNamespace(
+        text_pad_idx=0, n_vq=2, prism_input_rvq_channels=(1,), speech_vocab_size=1024
+    )
+    runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
+    buffers = PrismDecodeInputs(config, 4, device)
+    runner.model = SimpleNamespace(
+        config=config, n_vq=2, device=device, decode_inputs=buffers
+    )
+    requests = []
+    for index in range(3):
+        data = PrismRequestData(prompt=prompt(), sampling_seed=42 + index)
+        data.output_codes = [torch.tensor([1 + index, 2 + index])]
+        data.state.generation_kwargs = {
+            "audio_temperature": (1.7, 0.0, 0.8)[index],
+            "audio_top_p": (0.8, 1.0, 0.9)[index],
+            "audio_top_k": (25, 0, 50)[index],
+            "audio_repetition_penalty": (1.0, 1.2, 0.9)[index],
+        }
+        requests.append(SchedulerRequest(request_id=str(index), data=data))
+    logits = torch.randn(4, 1024, device=device)
+    # note (Zhang Yiyang): Capture padded rows before any real request is staged.
+    inputs = buffers.for_batch(4)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            inputs.sample(logits, 0)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sampled = inputs.sample(logits, 0)
+        captured_rows = inputs.rows.clone()
+
+    for active in (requests, requests[::-1], requests[1:2]):
+        runner.model.decode_inputs = None
+        runner.prepare(active, prefill=False)
+        expected = runner.model.batch_inputs.sample(logits[: len(active)].clone(), 0)
+        runner.model.decode_inputs = buffers
+        runner.prepare(active, prefill=False)
+        graph.replay()
+        torch.testing.assert_close(sampled[: len(active)], expected, rtol=0, atol=0)
+        assert captured_rows[: len(active), 0].tolist() == [config.text_pad_idx] * len(
+            active
+        )
+        torch.testing.assert_close(
+            captured_rows[: len(active), 1:].cpu(),
+            torch.stack([request.data.output_codes[-1] for request in active]),
+        )
+        for request in active:
+            request.data.output_codes.append(torch.tensor([3, 4]))
+            request.data.sampling_seed += 7
+            request.data.state.generation_kwargs["audio_repetition_penalty"] = 1.0

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build the SGLang eager AR engine for MOSS-TTS Prism."""
+"""Build the SGLang AR engine for MOSS-TTS Prism."""
 
 from __future__ import annotations
 
@@ -18,9 +18,13 @@ from sglang_omni.models.moss_tts_prism.request_builders import (
     apply_prism_result,
     build_prism_request,
 )
-from sglang_omni.models.moss_tts_prism.sglang_model import MossTTSPrismSGLangModel
+from sglang_omni.models.moss_tts_prism.sglang_model import (
+    MossTTSPrismSGLangModel,
+    PrismDecodeInputs,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_bs
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 
 
@@ -36,7 +40,6 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | bool]:
         return {
             **super().generation_defaults(dtype=dtype),
-            "disable_cuda_graph": True,
             "disable_radix_cache": True,
             "chunked_prefill_size": -1,
         }
@@ -47,11 +50,13 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError("MOSS-TTS Prism currently requires TP=1 and PP=1")
         if (
-            cfg.cuda_graph_config.decode.backend != "disabled"
+            cfg.cuda_graph_config.decode.backend not in ("disabled", "full")
             or cfg.cuda_graph_config.prefill.backend != "disabled"
             or cfg.enable_torch_compile
         ):
-            raise ValueError("MOSS-TTS Prism currently requires eager AR execution")
+            raise ValueError(
+                "MOSS-TTS Prism supports full decode graphs and eager prefill only, without torch.compile"
+            )
         if not cfg.disable_radix_cache or cfg.chunked_prefill_size > 0:
             raise ValueError(
                 "MOSS-TTS Prism currently requires radix cache and chunked prefill disabled"
@@ -63,6 +68,27 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor
     ) -> MossTTSPrismModelRunner:
         return MossTTSPrismModelRunner(model_worker, output_proc)
+
+    def setup_model(
+        self,
+        *,
+        model_worker: ModelWorker,
+        checkpoint_dir: str,
+        device: str,
+        gpu_id: int,
+        server_args: ServerArgs,
+    ) -> None:
+        if resolved_view(server_args).cuda_graph_config.decode.backend != "disabled":
+            model = model_worker.model_runner.model
+            model.decode_inputs = PrismDecodeInputs(
+                model.config, max(get_decode_cuda_graph_bs(server_args)), model.device
+            )
+
+    def post_cuda_graph_setup(
+        self, model: MossTTSPrismSGLangModel, server_args: ServerArgs
+    ) -> None:
+        # note (Zhang Yiyang): Prism samples inside the AR graph itself.
+        pass
 
     def make_adapters(
         self, model: MossTTSPrismSGLangModel

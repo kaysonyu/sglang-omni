@@ -71,6 +71,41 @@ class MossTTSPrismModelRunner(ModelRunner):
             indices.append(offset - 1)
         device = self.model.device
         params = [data.state.generation_kwargs for data in request_states]
+        decode = self.model.decode_inputs
+        batch_size = len(request_states)
+        if not prefill and decode is not None:
+            decode.rows[:batch_size].copy_(
+                torch.cat([piece["input_ids"] for piece in pieces])
+            )
+            for target, value in (
+                (decode.temperature, [p["audio_temperature"] for p in params]),
+                (decode.top_p, [p["audio_top_p"] for p in params]),
+                (decode.top_k, [p["audio_top_k"] for p in params]),
+                (decode.seeds, [data.sampling_seed for data in request_states]),
+                (
+                    decode.positions,
+                    [
+                        len(data.output_codes) * self.model.n_vq
+                        for data in request_states
+                    ],
+                ),
+            ):
+                target[:batch_size].copy_(torch.tensor(value, dtype=target.dtype))
+            penalties = [
+                parameters["audio_repetition_penalty"] for parameters in params
+            ]
+            decode.penalty[:batch_size].copy_(torch.tensor(penalties))
+            if any(penalty != 1.0 for penalty in penalties):
+                history = torch.zeros(
+                    (batch_size, self.model.n_vq, self.model.config.speech_vocab_size),
+                    dtype=torch.bool,
+                )
+                for row, data in enumerate(request_states):
+                    if data.output_codes:
+                        history[row].scatter_(1, torch.stack(data.output_codes).T, True)
+                decode.history[:batch_size].copy_(history)
+            return
+
         temperatures = torch.tensor(
             [p["audio_temperature"] for p in params], device=device
         )
@@ -151,7 +186,7 @@ class MossTTSPrismModelRunner(ModelRunner):
     ) -> None:
         cfg = self.model.config
         result.next_token_ids = torch.where(
-            result.logits_output.stop_logits.argmax(dim=-1).bool(),
+            result.logits_output.next_token_logits.argmax(dim=-1).bool(),
             cfg.audio_end_token_id,
             cfg.audio_assistant_gen_slot_token_id,
         )
@@ -165,7 +200,9 @@ class MossTTSPrismModelRunner(ModelRunner):
         scheduler_output: SchedulerOutput,
         outputs: dict[str, RequestOutput],
     ) -> None:
-        codes = result.logits_output.audio_codes.cpu()
+        codes = result.logits_output.customized_info["audio_codes"][
+            : len(scheduler_output.requests)
+        ].cpu()
         for index, request in enumerate(scheduler_output.requests):
             data = request.data
             # note (Zhang Yiyang): Prism's stop decision includes this frame;

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang eager execution for MOSS-TTS Prism."""
+"""SGLang execution for MOSS-TTS Prism."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Attention, Qwen3MLP
 from torch import nn
 from transformers import PretrainedConfig
+
+from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_branchless
 
 
 class FrameSampler(Protocol):
@@ -44,10 +46,68 @@ def prism_cache_layout(config: PretrainedConfig) -> tuple[tuple[int, int], ...]:
     )
 
 
-@dataclass
-class PrismModelOutput(LogitsProcessorOutput):
-    audio_codes: torch.Tensor | None = None
-    stop_logits: torch.Tensor | None = None
+class PrismDecodeInputs:
+    """Stable typed inputs and per-request sampling buffers for decode graphs."""
+
+    def __init__(
+        self, config: PretrainedConfig, capacity: int, device: torch.device
+    ) -> None:
+        self.rows = torch.zeros(
+            capacity, config.n_vq + 1, dtype=torch.long, device=device
+        )
+        self.rows[:, 0] = config.text_pad_idx
+        self.item_kind = torch.ones(capacity, dtype=torch.long, device=device)
+        self.audio_role = torch.full((capacity,), 2, dtype=torch.long, device=device)
+        self.retention = torch.zeros(
+            capacity, config.n_vq, dtype=torch.bool, device=device
+        )
+        self.retention[:, [c - 1 for c in config.prism_input_rvq_channels]] = True
+        self.successor_mask = torch.zeros(capacity, dtype=torch.bool, device=device)
+        self.successor_codes = torch.zeros(
+            capacity, config.n_vq, dtype=torch.long, device=device
+        )
+        self.sample_indices = torch.arange(capacity, device=device)
+        self.temperature = torch.ones(capacity, device=device)
+        self.top_p = torch.ones(capacity, device=device)
+        self.top_k = torch.ones(capacity, dtype=torch.long, device=device)
+        self.seeds = torch.zeros(capacity, dtype=torch.long, device=device)
+        self.positions = torch.zeros(capacity, dtype=torch.long, device=device)
+        self.penalty = torch.ones(capacity, device=device)
+        self.history = torch.zeros(
+            capacity,
+            config.n_vq,
+            config.speech_vocab_size,
+            dtype=torch.bool,
+            device=device,
+        )
+
+    def for_batch(self, batch_size: int) -> PrismBatchInputs:
+        def sample(logits: torch.Tensor, channel: int) -> torch.Tensor:
+            penalty = self.penalty[:batch_size, None]
+            logits = torch.where(
+                self.history[:batch_size, channel],
+                torch.where(logits < 0, logits * penalty, logits / penalty),
+                logits,
+            )
+            return sample_seeded_branchless(
+                logits,
+                temperature=self.temperature[:batch_size],
+                top_p=self.top_p[:batch_size],
+                top_k=self.top_k[:batch_size],
+                seeds=self.seeds[:batch_size],
+                positions=self.positions[:batch_size] + channel,
+            )
+
+        return PrismBatchInputs(
+            rows=self.rows[:batch_size],
+            item_kind=self.item_kind[:batch_size],
+            audio_role=self.audio_role[:batch_size],
+            retention=self.retention[:batch_size],
+            successor_mask=self.successor_mask[:batch_size],
+            successor_codes=self.successor_codes[:batch_size],
+            sample_indices=self.sample_indices[:batch_size],
+            sample=sample,
+        )
 
 
 class PrismDecoderLayer(nn.Module):
@@ -141,6 +201,7 @@ class MossTTSPrismSGLangModel(nn.Module):
         self.start_layer = 0
         self.end_layer = len(prism_cache_layout(config))
         self.batch_inputs: PrismBatchInputs | None = None
+        self.decode_inputs: PrismDecodeInputs | None = None
 
     @property
     def device(self) -> torch.device:
@@ -183,13 +244,15 @@ class MossTTSPrismSGLangModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
-    ) -> PrismModelOutput:
+    ) -> LogitsProcessorOutput:
         inputs = self.batch_inputs
+        if self.decode_inputs is not None and forward_batch.forward_mode.is_decode():
+            inputs = self.decode_inputs.for_batch(input_ids.numel())
         assert inputs is not None
         hidden = self.prepare_inputs(inputs)
         codes = inputs.successor_codes.clone()
         mask = inputs.successor_mask.clone()
-        mask[inputs.sample_indices] = True
+        mask.index_fill_(0, inputs.sample_indices, True)
         frames = torch.empty(
             (inputs.sample_indices.numel(), self.n_vq),
             dtype=torch.long,
@@ -278,10 +341,9 @@ class MossTTSPrismSGLangModel(nn.Module):
                         accumulated = incoming
             index = stop
         assert stop_logits is not None
-        return PrismModelOutput(
+        return LogitsProcessorOutput(
             next_token_logits=stop_logits,
-            audio_codes=frames,
-            stop_logits=stop_logits,
+            customized_info={"audio_codes": frames},
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
