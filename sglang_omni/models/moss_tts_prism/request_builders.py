@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Typed prompt and scheduler request adapters for MOSS-TTS Prism."""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+
+import torch
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
+from transformers import ProcessorMixin
+
+from sglang_omni.models.moss_tts.request_builders import (
+    _DATA_URI_RE,
+    derive_moss_tts_sampling_seed,
+    new_moss_tts_sampling_seed,
+)
+from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.request_builders import (
+    MOSS_STREAM_TRANSPORT_BATCH_FRAMES,
+    build_moss_tts_local_state,
+    build_moss_tts_local_stream_metadata,
+)
+from sglang_omni.models.moss_tts_local.stages import MossLocalReferenceEncoder
+from sglang_omni.models.moss_tts_prism.sglang_model import MossTTSPrismSGLangModel
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.scheduling.types import ARRequestData, RequestOutput
+
+
+@dataclass
+class PrismRequestData(ARRequestData):
+    enforce_request_limits: bool = True
+    req: Req | None = None
+    synced: bool = False
+    generation_steps: int = 0
+    stage_payload: StagePayload | None = None
+    state: MossTTSLocalState = field(default_factory=MossTTSLocalState)
+    prompt: dict[str, torch.Tensor] = field(default_factory=dict)
+    output_codes: list[torch.Tensor] = field(default_factory=list)
+    sampling_seed: int = field(default_factory=new_moss_tts_sampling_seed)
+    engine_start_s: float = 0.0
+    stream_metadata: dict[str, int | float | str | bool] | None = None
+    stream_pending_rows: list[torch.Tensor] = field(default_factory=list)
+    stream_first_batch_sent: bool = False
+
+
+class PrismStreamOutputBuilder:
+    def __call__(
+        self, request_id: str, data: PrismRequestData, output: RequestOutput
+    ) -> list[OutgoingMessage]:
+        if data.stream_metadata is None:
+            return []
+        codes = data.output_codes[-1]
+        row = torch.cat((data.prompt["input_ids"].new_zeros(1), codes))
+        data.stream_pending_rows.append(row)
+        threshold = (
+            MOSS_STREAM_TRANSPORT_BATCH_FRAMES if data.stream_first_batch_sent else 1
+        )
+        if len(data.stream_pending_rows) < threshold:
+            return []
+        return self.flush(request_id, data)
+
+    def flush(self, request_id: str, data: PrismRequestData) -> list[OutgoingMessage]:
+        if not data.stream_pending_rows:
+            return []
+        rows = torch.stack(data.stream_pending_rows)
+        data.stream_pending_rows.clear()
+        data.stream_first_batch_sent = True
+        return [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                target="vocoder",
+                data=rows,
+                metadata=data.stream_metadata,
+            )
+        ]
+
+
+def preprocess_prism_payload(
+    payload: StagePayload,
+    *,
+    processor: ProcessorMixin,
+    reference_encoder: MossLocalReferenceEncoder | None,
+) -> StagePayload:
+    state = build_moss_tts_local_state(payload)
+    for name in ("audio_temperature", "audio_top_p", "audio_repetition_penalty"):
+        if not math.isfinite(state.generation_kwargs[name]):
+            raise ValueError(f"MOSS-TTS Prism {name} must be finite")
+    for name in ("text_temperature", "text_top_p", "text_top_k"):
+        state.generation_kwargs.pop(name)
+    params = payload.request.params or {}
+    tts_params = (payload.request.metadata or {}).get("tts_params") or {}
+    for source in (params, tts_params):
+        if any(
+            source.get(name) is not None
+            for name in (
+                "text_temperature",
+                "text_top_p",
+                "text_top_k",
+                "execution_rvq_channels",
+                "returned_rvq_channels",
+                "loop_block_prefix_counts",
+            )
+        ):
+            raise ValueError(
+                "MOSS-TTS Prism supports audio sampling and full RVQ execution only"
+            )
+    if state.language is not None:
+        raise ValueError("MOSS-TTS Prism language guidance belongs in instructions")
+    reference = None
+    if state.ref_audio is not None:
+        if not isinstance(state.ref_audio, str):
+            raise ValueError(
+                "MOSS-TTS Prism reference must be a path or audio data URI"
+            )
+        codes = (
+            reference_encoder.encode_data_uri(state.ref_audio)
+            if _DATA_URI_RE.match(state.ref_audio)
+            else reference_encoder.encode(state.ref_audio)
+        )
+        reference = [codes]
+    message = processor.build_user_message(
+        script=state.text,
+        reference=reference,
+        global_instruction=state.instructions,
+        tokens=state.token_count,
+    )
+    batch = processor([[message]], mode="generation")
+    prompt = {name: value[0].cpu() for name, value in batch.items()}
+    return StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data={**state.to_dict(), "prism_inputs": prompt},
+    )
+
+
+def build_prism_request(
+    payload: StagePayload, *, model: MossTTSPrismSGLangModel
+) -> PrismRequestData:
+    state = MossTTSLocalState.from_dict(payload.data)
+    prompt = payload.data["prism_inputs"]
+    cfg = model.config
+    max_new_tokens = state.generation_kwargs["max_new_tokens"]
+    sampling = SamplingParams(
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        stop_token_ids=[cfg.audio_end_token_id],
+    )
+    sampling.normalize(None)
+    sampling.verify(cfg.language_config.vocab_size)
+    token_ids = prompt["input_ids"][:, 0].tolist()
+    req = Req(
+        rid=payload.request_id,
+        origin_input_text="",
+        origin_input_ids=token_ids,
+        sampling_params=sampling,
+        eos_token_ids={cfg.audio_end_token_id},
+        vocab_size=cfg.language_config.vocab_size,
+    )
+    seed = state.generation_kwargs.get("seed")
+    return PrismRequestData(
+        input_ids=torch.tensor(token_ids, dtype=torch.long),
+        max_new_tokens=max_new_tokens,
+        output_ids=req.output_ids,
+        req=req,
+        stage_payload=payload,
+        state=state,
+        prompt=prompt,
+        sampling_seed=(
+            derive_moss_tts_sampling_seed(seed)
+            if seed is not None
+            else new_moss_tts_sampling_seed()
+        ),
+        engine_start_s=time.perf_counter(),
+        stream_metadata=build_moss_tts_local_stream_metadata(payload, n_vq=cfg.n_vq),
+    )
+
+
+def apply_prism_result(data: PrismRequestData) -> StagePayload:
+    if not data.output_codes:
+        raise RuntimeError(
+            "MOSS-TTS Prism generated no audio frames. Please retry the request."
+        )
+    state = data.state
+    state.audio_codes = torch.stack(data.output_codes).cpu()
+    state.prompt_tokens = len(data.req.origin_input_ids)
+    state.completion_tokens = len(data.output_codes)
+    state.engine_time_s = time.perf_counter() - data.engine_start_s
+    payload = data.stage_payload
+    assert payload is not None
+    return StagePayload(
+        request_id=payload.request_id, request=payload.request, data=state.to_dict()
+    )

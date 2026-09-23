@@ -1,0 +1,3 @@
+config_cls: MossTTSPrismPipelineConfig
+model_path: /path/to/moss-tts-prism
+codec_model_path: OpenMOSS-Team/MOSS-Audio-Tokenizer-v2
