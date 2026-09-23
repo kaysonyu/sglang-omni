@@ -17,6 +17,7 @@ from sglang_omni.models.moss_tts_prism.model_runner import (
 from sglang_omni.models.moss_tts_prism.request_builders import (
     PrismRequestData,
     PrismStreamOutputBuilder,
+    build_prism_prompt,
     preprocess_prism_payload,
 )
 from sglang_omni.models.moss_tts_prism.sglang_model import (
@@ -278,12 +279,24 @@ def test_preprocess_uses_prism_prompt_fields():
     observed = {}
 
     class Processor:
+        model_config = SimpleNamespace(
+            n_vq=2, audio_start_token_id=5, audio_user_slot_token_id=6, text_pad_idx=0
+        )
+        chat_template = "template"
+        tokenizer = SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: messages[0]["content"],
+            encode=lambda content, **kwargs: [3, 7],
+        )
+
         def build_user_message(self, **kwargs):
             observed.update(kwargs)
-            return kwargs
+            return {"content": kwargs["script"], "audio_codes_list": []}
 
-        def __call__(self, conversations, mode):
-            return {name: value[None] for name, value in prompt().items()}
+        def _normalize_user(self, message):
+            return message
+
+        def _replace_placeholders(self, content, references, *, role):
+            return content
 
     payload = StagePayload(
         request_id="test",
@@ -302,8 +315,57 @@ def test_preprocess_uses_prism_prompt_fields():
         "global_instruction": "Speak softly",
         "tokens": None,
     }
-    assert prepared.data["prism_inputs"]["input_ids"].shape == (2, 3)
+    assert prepared.data["prism_inputs"]["input_ids"].tolist() == [
+        [3, 0, 0],
+        [7, 0, 0],
+        [5, 0, 0],
+    ]
     assert prepared.data["generation_kwargs"]["seed"] == 42
+
+
+def test_prompt_reference_frames_and_successor_edges():
+    codes = torch.tensor([[0, 1], [2, 3], [4, 0]])
+    message = {"content": "reference", "audio_codes_list": [codes]}
+    processor = SimpleNamespace(
+        model_config=SimpleNamespace(
+            n_vq=2, audio_start_token_id=5, audio_user_slot_token_id=6, text_pad_idx=9
+        ),
+        chat_template="template",
+        tokenizer=SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: messages[0]["content"],
+            encode=lambda content, **kwargs: [11, 5, 6, 6, 6, 7, 12],
+        ),
+        _normalize_user=lambda value: value,
+        _replace_placeholders=lambda content, refs, **kwargs: content,
+    )
+    prompt = build_prism_prompt(processor, message)
+    assert prompt["input_ids"].tolist() == [
+        [11, 0, 0],
+        [5, 0, 0],
+        [9, 0, 1],
+        [9, 2, 3],
+        [9, 4, 0],
+        [7, 0, 0],
+        [12, 0, 0],
+        [5, 0, 0],
+    ]
+    assert prompt["item_kind"].tolist() == [0, 0, 1, 1, 1, 0, 0, 0]
+    torch.testing.assert_close(prompt["audio_role"], prompt["item_kind"])
+    assert prompt["successor_audio_mask"].tolist() == [
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    torch.testing.assert_close(prompt["successor_audio_codes"][1:4], codes)
+    assert not prompt["successor_audio_codes"][[0, 4, 5, 6, 7]].any()
+    assert prompt["target_history_retention_mask"].all()
+    assert prompt["attention_mask"].all()
+    assert prompt["position_ids"].tolist() == list(range(8))
 
 
 @pytest.mark.parametrize("vocoder_cuda_graph", [None, False, True])

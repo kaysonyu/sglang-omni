@@ -80,6 +80,56 @@ class PrismStreamOutputBuilder:
         ]
 
 
+def build_prism_prompt(
+    processor: ProcessorMixin, message: dict[str, object]
+) -> dict[str, torch.Tensor]:
+    """Pack a generation prompt without allocating tensors for individual tokens."""
+    message = processor._normalize_user(message)
+    references = message["audio_codes_list"]
+    content = processor._replace_placeholders(
+        message["content"], references, role="user"
+    )
+    content = processor.tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
+        chat_template=processor.chat_template,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    config = processor.model_config
+    tokens = torch.tensor(
+        processor.tokenizer.encode(content, add_special_tokens=False)
+        + [config.audio_start_token_id],
+        dtype=torch.long,
+    )
+    count = tokens.numel()
+    rows = torch.zeros(count, config.n_vq + 1, dtype=torch.long)
+    rows[:, 0] = tokens
+    kinds = torch.zeros(count, dtype=torch.long)
+    successors = torch.zeros(count, config.n_vq, dtype=torch.long)
+    successor_mask = torch.zeros(count, dtype=torch.bool)
+    if references:
+        codes = torch.cat(references)
+        audio_rows = (tokens == config.audio_user_slot_token_id).nonzero().flatten()
+        rows[audio_rows, 0] = config.text_pad_idx
+        rows[audio_rows, 1:] = codes
+        kinds[audio_rows] = 1
+        # note (Zhang Yiyang): Each reference frame conditions its preceding row.
+        successors[audio_rows - 1] = codes
+        successor_mask[audio_rows - 1] = True
+    return {
+        "input_ids": rows,
+        "attention_mask": torch.ones(count, dtype=torch.bool),
+        "position_ids": torch.arange(count),
+        "item_kind": kinds,
+        "audio_role": kinds.clone(),
+        "target_history_retention_mask": torch.ones(
+            count, config.n_vq, dtype=torch.bool
+        ),
+        "successor_audio_mask": successor_mask,
+        "successor_audio_codes": successors,
+    }
+
+
 def preprocess_prism_payload(
     payload: StagePayload,
     *,
@@ -129,8 +179,7 @@ def preprocess_prism_payload(
         global_instruction=state.instructions,
         tokens=state.token_count,
     )
-    batch = processor([[message]], mode="generation")
-    prompt = {name: value[0].cpu() for name, value in batch.items()}
+    prompt = build_prism_prompt(processor, message)
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
