@@ -306,13 +306,19 @@ def test_preprocess_uses_prism_prompt_fields():
     assert prepared.data["generation_kwargs"]["seed"] == 42
 
 
-def test_pipeline_registers_separate_architecture_with_decode_graphs():
-    config = MossTTSPrismPipelineConfig(model_path="model")
+@pytest.mark.parametrize("vocoder_cuda_graph", [None, False, True])
+def test_pipeline_registers_separate_architecture_with_decode_graphs(
+    vocoder_cuda_graph,
+):
+    config = MossTTSPrismPipelineConfig(
+        model_path="model", vocoder_cuda_graph=vocoder_cuda_graph
+    )
     assert config.architecture == "MossTTSPrismModel"
     assert not config.stage_named("tts_engine").engine.disable_cuda_graph
     assert config.stage_named("tts_engine").stream_to == ["vocoder"]
     assert config.stage_factory_kwargs("vocoder") == {
-        "codec_model_path": config.codec_model_path
+        "codec_model_path": config.codec_model_path,
+        "vocoder_cuda_graph": vocoder_cuda_graph,
     }
 
 

@@ -59,13 +59,19 @@ class MossTTSPrismPipelineConfig(PipelineConfig):
         "tts_engine": EngineStageConfig
     }
     stages: list[StageConfig] = Field(default_factory=stages)
+    vocoder_cuda_graph: bool | None = None
     codec_model_path: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2"
     env_defaults: dict[str, str] = Field(
         default_factory=lambda: {"OMP_NUM_THREADS": "4"}
     )
 
-    def stage_factory_kwargs(self, stage_name: str) -> dict[str, str]:
-        if stage_name in ("preprocessing", "vocoder"):
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, str | bool | None]:
+        if stage_name == "vocoder":
+            return {
+                "codec_model_path": self.codec_model_path,
+                "vocoder_cuda_graph": self.vocoder_cuda_graph,
+            }
+        if stage_name == "preprocessing":
             return {"codec_model_path": self.codec_model_path}
         return {}
 

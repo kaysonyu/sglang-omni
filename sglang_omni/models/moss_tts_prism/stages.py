@@ -16,6 +16,7 @@ from sglang_omni.models.moss_tts.hf_loading import (
     load_moss_processor_class,
     moss_transformers_processor_compat,
 )
+from sglang_omni.models.moss_tts_local.config import resolve_vocoder_cuda_graph
 from sglang_omni.models.moss_tts_local.stages import (
     BatchedReferenceEncoder,
     MossLocalReferenceEncoder,
@@ -95,7 +96,11 @@ def create_vocoder_executor(
     stream_chunk_frames: int = 25,
     initial_chunk_frames: int = 5,
     max_batch_size: int = 8,
+    vocoder_cuda_graph: bool | None = None,
+    vocoder_cuda_graph_frames: list[int] | None = None,
+    vocoder_cuda_graph_min_free_gb: float = 3.0,
 ) -> MossTTSLocalStreamingVocoderScheduler:
+    vocoder_cuda_graph = resolve_vocoder_cuda_graph(vocoder_cuda_graph)
     device = str(resolve_concrete_device(device, gpu_id))
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocoder = load_moss_audio_vocoder(
@@ -105,7 +110,7 @@ def create_vocoder_executor(
         compute_dtype=torch.bfloat16,
         attention_backend="auto",
     )
-    return MossTTSLocalStreamingVocoderScheduler(
+    scheduler = MossTTSLocalStreamingVocoderScheduler(
         vocoder.model,
         n_vq=config.n_vq,
         sample_rate=vocoder.sample_rate,
@@ -114,5 +119,9 @@ def create_vocoder_executor(
         stream_chunk_frames=stream_chunk_frames,
         initial_chunk_frames=initial_chunk_frames,
         max_batch_size=max_batch_size,
-        vocoder_cuda_graph=False,
+        vocoder_cuda_graph=vocoder_cuda_graph,
+        vocoder_cuda_graph_frames=vocoder_cuda_graph_frames,
+        vocoder_cuda_graph_min_free_gb=vocoder_cuda_graph_min_free_gb,
     )
+    scheduler.warmup_now()
+    return scheduler
