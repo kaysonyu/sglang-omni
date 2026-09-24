@@ -311,6 +311,7 @@ class MossTTSLocalStreamingVocoderScheduler(
 
     can_batch_stream_chunks = True
     stream_chunk_batch_distinct_requests = True
+    pump_on_chunk_batch = False
 
     def __init__(
         self,
@@ -427,6 +428,8 @@ class MossTTSLocalStreamingVocoderScheduler(
         origin: str,
     ) -> None:
         if origin == "payload":
+            if state.threshold > 0:
+                return
             params = (
                 source.request.params
                 if isinstance(source.request.params, dict)
@@ -546,6 +549,35 @@ class MossTTSLocalStreamingVocoderScheduler(
         if state.slot is not None and self._session is not None:
             self._session.release(state.slot)
 
+    def has_ready_work(self) -> bool:
+        return bool(
+            self.select_step_participants()
+            or self.pending_done.intersection(self.stream_payloads)
+        )
+
+    def on_stream_done(self, request_id: str) -> None:
+        # note (Zhang Yiyang): Finished streams must join the next batch,
+        # rather than decode their entire backlog while handling a message.
+        self.pending_done.add(request_id)
+
+    def run_ready_step(self) -> None:
+        with self.state_lock:
+            failed = self.pump_one_step() or []
+            for request_id in self.pending_done.intersection(self.stream_payloads):
+                state = self.stream_states[request_id]
+                if state.pending and state.slot is not None:
+                    continue
+                try:
+                    self.complete_stream_request(
+                        request_id, self.finish_stream(request_id)
+                    )
+                except Exception as exc:
+                    self.emit_error(request_id, exc)
+                    self.abort_state(request_id)
+                    failed.append(request_id)
+        for request_id in failed:
+            self.cleanup_aborted_request(request_id)
+
     def select_step_participants(self) -> list[tuple[str, LocalStreamState]]:
         """Every stream whose buffer crossed its threshold is due; due streams
         coalesce with peers above the join floor into one forward."""
@@ -558,10 +590,21 @@ class MossTTSLocalStreamingVocoderScheduler(
             if state.slot is not None and state.threshold > 0
         ]
         due = [
-            entry for entry in slotted if len(entry[1].pending) >= entry[1].threshold
+            entry
+            for entry in slotted
+            if len(entry[1].pending) >= entry[1].threshold
+            or (entry[0] in self.pending_done and entry[1].pending)
         ]
         if not due:
             return []
+        # note (Zhang Yiyang): Short final tails must not fragment ongoing audio.
+        tails = [
+            entry
+            for entry in due
+            if entry[0] in self.pending_done and len(entry[1].pending) < join_floor
+        ]
+        if tails:
+            return tails
         floor = min(
             min(len(state.pending) for _, state in due),
             join_floor,
@@ -575,8 +618,7 @@ class MossTTSLocalStreamingVocoderScheduler(
     def build_step_plan(
         self, participants: list[tuple[str, LocalStreamState]]
     ) -> CoalescedStepPlan:
-        """Uniform step capped at the steady chunk size and any un-emitted
-        participant's first-chunk threshold; the base pump re-pumps remainder."""
+        """Build one uniform step while preserving first-chunk boundaries."""
         step_t = min(
             min(len(state.pending) for _, state in participants),
             self._stream_chunk_frames,
@@ -608,6 +650,8 @@ class MossTTSLocalStreamingVocoderScheduler(
     def can_join_coalesced_step(
         self, request_id: str, state: LocalStreamState, floor: int
     ) -> bool:
+        if request_id in self.pending_done:
+            return bool(state.pending)
         if len(state.pending) >= state.threshold:
             return True
         if not self.stream_has_emitted(request_id):
