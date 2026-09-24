@@ -235,8 +235,22 @@ def test_stop_projection_stays_fp32_under_autocast():
 
 @pytest.mark.parametrize("frames", [1, 3, 7])
 @pytest.mark.parametrize("stop", [True, False])
-def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop):
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop, device):
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
+    runner._token_id_host_bufs = None
+    runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -251,16 +265,19 @@ def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop):
     for index in range(frames):
         result = SimpleNamespace(
             logits_output=LogitsProcessorOutput(
-                customized_info={"audio_codes": torch.tensor([[index, index + 1]])},
-                next_token_logits=(
-                    torch.tensor([[0.0, 1.0]])
-                    if stop and index == frames - 1
-                    else torch.tensor([[1.0, 0.0]])
+                customized_info={
+                    "audio_codes": torch.tensor([[index, index + 1]], device=device)
+                },
+                next_token_logits=torch.tensor(
+                    [[0.0, 1.0]] if stop and index == frames - 1 else [[1.0, 0.0]],
+                    device=device,
                 ),
             )
         )
         runner.post_decode(result, None, None, [request])
-        output = RequestOutput(request_id="test", data=result.next_token_ids.item())
+        host_ids = runner.resolve_host_token_ids(result)
+        assert host_ids.device.type == "cpu"
+        output = RequestOutput(request_id="test", data=host_ids.item())
         runner.post_process_outputs(
             result, SimpleNamespace(requests=[request]), {"test": output}
         )

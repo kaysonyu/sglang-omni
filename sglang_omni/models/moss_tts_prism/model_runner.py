@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_fused
 from sglang_omni.models.moss_tts_prism.request_builders import PrismRequestData
 from sglang_omni.models.moss_tts_prism.sglang_model import PrismBatchInputs
 from sglang_omni.scheduling.types import (
@@ -56,6 +57,52 @@ def prism_request_inputs(
 class MossTTSPrismModelRunner(ModelRunner):
     def prepare(self, requests: list[SchedulerRequest], *, prefill: bool) -> None:
         request_states = [request.data for request in requests]
+        device = self.model.device
+        params = [data.state.generation_kwargs for data in request_states]
+        decode = self.model.decode_inputs
+        batch_size = len(request_states)
+        if not prefill and decode is not None:
+            decode.rows_cpu[:batch_size, 1:].copy_(
+                torch.stack([data.output_codes[-1] for data in request_states])
+            )
+            penalties = [p["audio_repetition_penalty"] for p in params]
+            decode.floats_cpu[:, :batch_size].copy_(
+                torch.tensor(
+                    [
+                        [p["audio_temperature"] for p in params],
+                        [p["audio_top_p"] for p in params],
+                        penalties,
+                    ],
+                    dtype=torch.float32,
+                )
+            )
+            decode.ints_cpu[:, :batch_size].copy_(
+                torch.tensor(
+                    [
+                        [p["audio_top_k"] for p in params],
+                        [data.sampling_seed for data in request_states],
+                        [
+                            len(data.output_codes) * self.model.n_vq
+                            for data in request_states
+                        ],
+                    ],
+                    dtype=torch.long,
+                )
+            )
+            decode.rows.copy_(decode.rows_cpu, non_blocking=True)
+            decode.sampling_floats.copy_(decode.floats_cpu, non_blocking=True)
+            decode.sampling_ints.copy_(decode.ints_cpu, non_blocking=True)
+            if any(p != 1.0 for p in penalties):
+                history = torch.zeros(
+                    (batch_size, self.model.n_vq, self.model.config.speech_vocab_size),
+                    dtype=torch.bool,
+                )
+                for row, data in enumerate(request_states):
+                    if data.output_codes:
+                        history[row].scatter_(1, torch.stack(data.output_codes).T, True)
+                decode.history[:batch_size].copy_(history)
+            return
+
         pieces = [
             prism_request_inputs(data, self.model.config, prefill=prefill)
             for data in request_states
@@ -69,43 +116,6 @@ class MossTTSPrismModelRunner(ModelRunner):
                 assert data.req.extend_range.length == length
             offset += length
             indices.append(offset - 1)
-        device = self.model.device
-        params = [data.state.generation_kwargs for data in request_states]
-        decode = self.model.decode_inputs
-        batch_size = len(request_states)
-        if not prefill and decode is not None:
-            decode.rows[:batch_size].copy_(
-                torch.cat([piece["input_ids"] for piece in pieces])
-            )
-            for target, value in (
-                (decode.temperature, [p["audio_temperature"] for p in params]),
-                (decode.top_p, [p["audio_top_p"] for p in params]),
-                (decode.top_k, [p["audio_top_k"] for p in params]),
-                (decode.seeds, [data.sampling_seed for data in request_states]),
-                (
-                    decode.positions,
-                    [
-                        len(data.output_codes) * self.model.n_vq
-                        for data in request_states
-                    ],
-                ),
-            ):
-                target[:batch_size].copy_(torch.tensor(value, dtype=target.dtype))
-            penalties = [
-                parameters["audio_repetition_penalty"] for parameters in params
-            ]
-            decode.penalty[:batch_size].copy_(torch.tensor(penalties))
-            if any(penalty != 1.0 for penalty in penalties):
-                history = torch.zeros(
-                    (batch_size, self.model.n_vq, self.model.config.speech_vocab_size),
-                    dtype=torch.bool,
-                )
-                for row, data in enumerate(request_states):
-                    if data.output_codes:
-                        history[row].scatter_(1, torch.stack(data.output_codes).T, True)
-                decode.history[:batch_size].copy_(history)
-            return
-
         temperatures = torch.tensor(
             [p["audio_temperature"] for p in params], device=device
         )
@@ -119,16 +129,29 @@ class MossTTSPrismModelRunner(ModelRunner):
             device=device,
         )
 
+        penalty_histories = [
+            (
+                row,
+                parameters["audio_repetition_penalty"],
+                torch.stack(data.output_codes).to(device),
+            )
+            for row, (data, parameters) in enumerate(zip(request_states, params))
+            if parameters["audio_repetition_penalty"] != 1.0 and data.output_codes
+        ]
+
         def sample(logits: torch.Tensor, channel: int) -> torch.Tensor:
-            for row, data in enumerate(request_states):
-                penalty = params[row]["audio_repetition_penalty"]
-                if penalty != 1.0 and data.output_codes:
-                    history = torch.stack(data.output_codes)[:, channel].to(device)
-                    scores = logits[row, history]
-                    logits[row, history] = torch.where(
-                        scores < 0, scores * penalty, scores / penalty
-                    )
-            return MossTTSModelRunner.sample_tokens(
+            for row, penalty, history in penalty_histories:
+                tokens = history[:, channel]
+                scores = logits[row, tokens]
+                logits[row, tokens] = torch.where(
+                    scores < 0, scores * penalty, scores / penalty
+                )
+            sampler = (
+                sample_seeded_fused
+                if logits.is_cuda
+                else MossTTSModelRunner.sample_tokens
+            )
+            return sampler(
                 logits,
                 temperature=temperatures,
                 top_p=top_p,
@@ -190,6 +213,7 @@ class MossTTSPrismModelRunner(ModelRunner):
             cfg.audio_end_token_id,
             cfg.audio_assistant_gen_slot_token_id,
         )
+        self.stage_token_ids(result, result.next_token_ids)
         self.model.batch_inputs = None
 
     post_prefill = post_decode

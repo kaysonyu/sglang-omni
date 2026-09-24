@@ -18,7 +18,7 @@ from sglang.srt.models.qwen3 import Qwen3Attention, Qwen3MLP
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_branchless
+from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_fused
 from sglang_omni.models.moss_tts_prism.embedding_kernels import (
     feedback_embeddings,
     input_embeddings,
@@ -71,12 +71,24 @@ class PrismDecodeInputs:
             capacity, config.n_vq, dtype=torch.long, device=device
         )
         self.sample_indices = torch.arange(capacity, device=device)
-        self.temperature = torch.ones(capacity, device=device)
-        self.top_p = torch.ones(capacity, device=device)
-        self.top_k = torch.ones(capacity, dtype=torch.long, device=device)
-        self.seeds = torch.zeros(capacity, dtype=torch.long, device=device)
-        self.positions = torch.zeros(capacity, dtype=torch.long, device=device)
-        self.penalty = torch.ones(capacity, device=device)
+        self.sampling_floats = torch.ones(3, capacity, device=device)
+        self.temperature, self.top_p, self.penalty = self.sampling_floats.unbind()
+        self.sampling_ints = torch.zeros(3, capacity, dtype=torch.long, device=device)
+        self.top_k, self.seeds, self.positions = self.sampling_ints.unbind()
+        self.top_k.fill_(1)
+        # note (Zhang Yiyang): Synchronous decode consumes the previous frame
+        # before reusing these pinned inputs.
+        self.rows_cpu = torch.zeros_like(
+            self.rows, device="cpu", pin_memory=device.type == "cuda"
+        )
+        self.rows_cpu[:, 0] = config.text_pad_idx
+        self.floats_cpu = torch.ones_like(
+            self.sampling_floats, device="cpu", pin_memory=device.type == "cuda"
+        )
+        self.ints_cpu = torch.zeros_like(
+            self.sampling_ints, device="cpu", pin_memory=device.type == "cuda"
+        )
+        self.ints_cpu[0].fill_(1)
         self.history = torch.zeros(
             capacity,
             config.n_vq,
@@ -93,7 +105,7 @@ class PrismDecodeInputs:
                 torch.where(logits < 0, logits * penalty, logits / penalty),
                 logits,
             )
-            return sample_seeded_branchless(
+            return sample_seeded_fused(
                 logits,
                 temperature=self.temperature[:batch_size],
                 top_p=self.top_p[:batch_size],
