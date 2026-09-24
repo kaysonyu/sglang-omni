@@ -339,3 +339,18 @@ def test_model_worker_update_weights_from_distributed_rejects_mismatched_metadat
     assert success is False
     assert "same length" in message
     assert calls == 0
+
+
+def test_model_info_without_rollout_extension_keeps_default_capabilities() -> None:
+    worker = object.__new__(ModelWorker)
+    worker.model_runner = SimpleNamespace(model=object())
+    worker.tp_rank = 0
+    worker.model_arch_override = None
+    worker.prefill_cuda_graph_info = lambda: {"backend": "disabled"}
+    with get_context().override_server_args(
+        model_path="test-model", load_format="auto", weight_version="v1", tp_size=1
+    ):
+        info = worker.model_info()
+    assert info["weight_version"] == "v1"
+    assert info["supports_weight_update"] and info["supports_weight_checker"]
+    assert "rollout_schema_versions" not in info
