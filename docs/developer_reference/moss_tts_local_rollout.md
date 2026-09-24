@@ -5,9 +5,13 @@ The pipeline-level `enable_rl` option defaults to `false`. RL instances prepare
 frame-decode graphs that include selected-action logprobs during startup;
 ordinary instances keep the existing graphs and skip that computation.
 With frame graphs disabled or an uncaptured batch size, RL uses the same
-branchless frame decoder eagerly. No teacher scoring endpoint is added.
+branchless frame decoder eagerly. Teacher scoring runs in a separate service.
 
-RL rollout is used with non-streaming requests (`stream=false`).
+RL rollout is used with non-streaming requests (`stream=false`). The dedicated
+configuration disables vocoder CUDA graphs because they only accelerate
+streaming codec steps and otherwise reserve GPU memory at startup. This does
+not disable the tts_engine frame-decode graphs.
+
 It accepts a text prompt or a dictionary containing text and references.
 Send `/generate` requests with `return_logprob=true` and
 `return_omni_rollout=true`. Supply positive text/audio temperatures,

@@ -161,7 +161,8 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     # note (Zhang Yiyang): These options only control streaming vocoder graphs;
     # AR engine graph settings are scoped to tts_engine.engine.
     # None preserves whether the user supplied an override. The resolved
-    # default is on except on ROCm WSL/DXG, where capture can abort in C++.
+    # default is on for ordinary serving, off for non-streaming RL, and off
+    # on ROCm WSL/DXG, where capture can abort in C++.
     vocoder_cuda_graph: bool | None = None
     vocoder_cuda_graph_frames: list[int] | None = None
     vocoder_cuda_graph_min_free_gb: float = 3.0
@@ -188,10 +189,11 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
                 }
             return {"enable_rl": True} if self.enable_rl else {}
         if stage_name == "vocoder":
+            vocoder_cuda_graph = self.vocoder_cuda_graph
+            if self.enable_rl and vocoder_cuda_graph is None:
+                vocoder_cuda_graph = False
             return {
-                "vocoder_cuda_graph": resolve_vocoder_cuda_graph(
-                    self.vocoder_cuda_graph
-                ),
+                "vocoder_cuda_graph": resolve_vocoder_cuda_graph(vocoder_cuda_graph),
                 "vocoder_cuda_graph_frames": self.vocoder_cuda_graph_frames,
                 "vocoder_cuda_graph_min_free_gb": self.vocoder_cuda_graph_min_free_gb,
             }
