@@ -19,6 +19,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_branchless
+from sglang_omni.models.moss_tts_prism.embedding_kernels import (
+    feedback_embeddings,
+    input_embeddings,
+)
 
 
 class FrameSampler(Protocol):
@@ -217,6 +221,17 @@ class MossTTSPrismSGLangModel(nn.Module):
         return self.audio_embeddings[channel].weight
 
     def prepare_inputs(self, inputs: PrismBatchInputs) -> torch.Tensor:
+        if inputs.rows.is_cuda:
+            return input_embeddings(
+                inputs.rows,
+                inputs.item_kind,
+                inputs.audio_role,
+                inputs.retention,
+                self.transformer.embed_tokens.weight,
+                tuple(self.audio_weight(channel) for channel in range(self.n_vq)),
+                self.config.text_pad_idx,
+                tuple(self.config.prism_input_rvq_channels),
+            )
         text = inputs.item_kind.eq(0)
         active = text & inputs.rows[:, 0].ne(self.config.text_pad_idx)
         hidden = self.transformer.embed_tokens(
@@ -321,14 +336,24 @@ class MossTTSPrismSGLangModel(nn.Module):
                         frames[:, head - 1] = selected
                         codes[inputs.sample_indices, head - 1] = selected
                     if application != len(units) - 1:
-                        for head in heads:
-                            embedding = F.embedding(
-                                codes[:, head - 1].masked_fill(~mask, 0),
-                                self.audio_weight(head - 1),
-                            ) * mask.unsqueeze(-1)
-                            incoming = (
-                                embedding if incoming is None else incoming + embedding
+                        if codes.is_cuda:
+                            incoming = feedback_embeddings(
+                                codes,
+                                mask,
+                                tuple(self.audio_weight(head - 1) for head in heads),
+                                tuple(head - 1 for head in heads),
                             )
+                        else:
+                            for head in heads:
+                                embedding = F.embedding(
+                                    codes[:, head - 1].masked_fill(~mask, 0),
+                                    self.audio_weight(head - 1),
+                                ) * mask.unsqueeze(-1)
+                                incoming = (
+                                    embedding
+                                    if incoming is None
+                                    else incoming + embedding
+                                )
                 if is_loop:
                     if self.topology.reapply_rvq_conditioning_in_loop:
                         if incoming is not None:

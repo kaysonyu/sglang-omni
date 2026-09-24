@@ -496,3 +496,107 @@ def test_decode_graph_refreshes_seed_history_and_batch_rows():
             request.data.output_codes.append(torch.tensor([3, 4]))
             request.data.sampling_seed += 7
             request.data.state.generation_kwargs["audio_repetition_penalty"] = 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rows, hidden", [(1, 2048), (16, 2048), (125, 257)])
+def test_fused_embeddings_match_eager_and_graph_replay(dtype, rows, hidden):
+    from sglang_omni.models.moss_tts_prism.embedding_kernels import (
+        feedback_embeddings,
+        input_embeddings,
+    )
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(42)
+    weights = tuple(
+        torch.randn(32, hidden, device=device, dtype=dtype, generator=generator)
+        for _ in range(24)
+    )
+    text_weight = torch.randn(
+        32, hidden, device=device, dtype=dtype, generator=generator
+    )
+    inputs = PrismBatchInputs(
+        rows=torch.randint(0, 32, (rows, 25), device=device, generator=generator),
+        item_kind=torch.arange(rows, device=device) % 2,
+        audio_role=torch.arange(rows, device=device) % 3,
+        retention=torch.rand(rows, 24, device=device, generator=generator) > 0.5,
+        successor_mask=torch.arange(rows, device=device) % 2 == 0,
+        successor_codes=torch.randint(
+            0, 32, (rows, 24), device=device, generator=generator
+        ),
+        sample_indices=torch.tensor([rows - 1], device=device),
+        sample=lambda logits, channel: logits.argmax(-1),
+    )
+    channels = (1, 3, 7)
+    feedback_channels = (0,) if rows == 1 else (0, 23)
+
+    def eager():
+        text = inputs.item_kind == 0
+        active = text & (inputs.rows[:, 0] != 0)
+        value = text_weight[inputs.rows[:, 0].masked_fill(~active, 0)] * active[:, None]
+        for channel, weight in enumerate(weights):
+            active = ~text & (
+                (inputs.audio_role != 2)
+                | ((channel + 1 in channels) & inputs.retention[:, channel])
+            )
+            value = (
+                value
+                + weight[inputs.rows[:, channel + 1].masked_fill(~active, 0)]
+                * active[:, None]
+            )
+        delta = None
+        for channel in feedback_channels:
+            embedding = (
+                weights[channel][
+                    inputs.successor_codes[:, channel].masked_fill(
+                        ~inputs.successor_mask, 0
+                    )
+                ]
+                * inputs.successor_mask[:, None]
+            )
+            delta = embedding if delta is None else delta + embedding
+        return value, delta
+
+    def fused():
+        return (
+            input_embeddings(
+                inputs.rows,
+                inputs.item_kind,
+                inputs.audio_role,
+                inputs.retention,
+                text_weight,
+                weights,
+                0,
+                channels,
+            ),
+            feedback_embeddings(
+                inputs.successor_codes,
+                inputs.successor_mask,
+                tuple(weights[channel] for channel in feedback_channels),
+                feedback_channels,
+            ),
+        )
+
+    for actual, expected in zip(fused(), eager()):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fused()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = fused()
+    inputs.rows.add_(1).remainder_(32)
+    inputs.successor_codes.add_(3).remainder_(32)
+    inputs.successor_mask.logical_not_()
+    inputs.retention.logical_not_()
+    inputs.item_kind.copy_(1 - inputs.item_kind)
+    inputs.audio_role.add_(1).remainder_(3)
+    text_weight.mul_(0.5)
+    weights[0].mul_(0.5)
+    weights[-1].add_(0.25)
+    graph.replay()
+    for actual, expected in zip(outputs, eager()):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
