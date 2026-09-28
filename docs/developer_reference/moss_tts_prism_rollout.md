@@ -113,4 +113,21 @@ projected through each scoring head at once (default 128). Scores come from the
 teacher's BF16 replay and need not match the student's recorded behavior scores,
 even for equal checkpoint weights, because the execution shapes differ.
 
-Full Prism disk/NCCL student update validation remains separate work.
+## Student weight updates
+
+Use the shared [RL admin endpoints](rl_admin_control.md) with checkpoints that
+retain the same configuration and parameter shapes. Pause generation with
+`mode: "abort"` before publishing weights.
+
+For NCCL updates, send the complete checkpoint weight map in sorted HF key order.
+Keep `keep_pause: true` and `flush_cache: true` on every bucket. Omit
+`weight_version` on intermediate buckets and publish it only with the final
+bucket. After all buckets succeed, confirm the version through `/model_info`
+and call `/continue_generation`. The loader writes into existing parameter
+storage, allowing the captured prefill and decode graphs to use the new weights.
+
+Tensor loading can fail after some weights have changed. In that case, the stage
+stays paused and does not publish the failed bucket's version. Restore a complete
+checkpoint with `/update_weights_from_disk` or a complete NCCL update before
+resuming; retain `keep_pause: true` during recovery. Same-shape disk reloads also
+support `recapture_cuda_graph: false`.
