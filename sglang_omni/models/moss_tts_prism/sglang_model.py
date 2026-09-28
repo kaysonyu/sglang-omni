@@ -29,7 +29,6 @@ from sglang_omni.models.moss_tts_prism.embedding_kernels import (
     feedback_embeddings,
     input_embeddings,
 )
-from sglang_omni.sampling.logprobs import selected_action_logprobs
 
 
 class FrameSampler(Protocol):
@@ -46,7 +45,6 @@ class PrismBatchInputs:
     successor_codes: torch.Tensor
     sample_indices: torch.Tensor
     sample: FrameSampler
-    temperature: torch.Tensor | None = None
     code_logprobs: torch.Tensor | None = None
 
 
@@ -113,6 +111,17 @@ class PrismDecodeInputs:
         )
 
     def for_batch(self, batch_size: int) -> PrismBatchInputs:
+        code_logprobs = (
+            torch.empty(
+                batch_size,
+                self.rows.shape[1] - 1,
+                device=self.rows.device,
+                dtype=torch.float32,
+            )
+            if self.enable_rl
+            else None
+        )
+
         def sample(logits: torch.Tensor, channel: int) -> torch.Tensor:
             penalty = self.penalty[:batch_size, None]
             logits = torch.where(
@@ -127,6 +136,9 @@ class PrismDecodeInputs:
                 top_k=self.top_k[:batch_size],
                 seeds=self.seeds[:batch_size],
                 positions=self.positions[:batch_size] + channel,
+                full_vocab_logprobs=(
+                    code_logprobs[:, channel] if code_logprobs is not None else None
+                ),
             )
 
         return PrismBatchInputs(
@@ -138,17 +150,7 @@ class PrismDecodeInputs:
             successor_codes=self.successor_codes[:batch_size],
             sample_indices=self.sample_indices[:batch_size],
             sample=sample,
-            temperature=self.temperature[:batch_size],
-            code_logprobs=(
-                torch.empty(
-                    batch_size,
-                    self.rows.shape[1] - 1,
-                    device=self.rows.device,
-                    dtype=torch.float32,
-                )
-                if self.enable_rl
-                else None
-            ),
+            code_logprobs=code_logprobs,
         )
 
 
@@ -370,11 +372,6 @@ class MossTTSPrismSGLangModel(nn.Module):
             (head, inputs.sample(scores.float(), head - 1))
             for head, scores in zip(heads, logits)
         ]
-        if inputs.code_logprobs is not None:
-            for scores, (head, selected) in zip(logits, sampled):
-                inputs.code_logprobs[:, head - 1] = selected_action_logprobs(
-                    scores, selected, inputs.temperature
-                )
         return stop_logits, sampled
 
     @torch.no_grad()

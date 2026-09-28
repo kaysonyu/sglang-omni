@@ -169,6 +169,9 @@ def fused_seeded_sample_kernel(
     seeds_ptr,
     positions_ptr,
     output_ptr,
+    logprobs_ptr,
+    LOGPROB_STRIDE: tl.constexpr,
+    FULL_VOCAB: tl.constexpr,
     VOCAB: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -188,51 +191,62 @@ def fused_seeded_sample_kernel(
     safe_temp = tl.where(do_sample, temp, 1.0)
     scores = logits / safe_temp
 
-    # Note (Jiaxin Deng): key packs orderable score bits above a complemented
-    # index so equal scores keep input order, matching cub's stable radix sort
-    # (torch.sort) bit-for-bit at nucleus tie boundaries. -0.0 canonicalizes to
-    # +0.0 first: the zeros compare equal numerically, so bit-distinct keys
-    # would break that input-order tie rule.
-    key_scores = tl.where(scores == 0.0, 0.0, scores)
-    bits = key_scores.to(tl.int32, bitcast=True)
-    orderable = (bits ^ ((bits >> 31) | -2147483648)).to(tl.uint32).to(tl.int64)
-    biased = orderable - tl.full((), 2147483648, tl.int64)
-    idx64 = idx.to(tl.int64)
-    inv_idx = tl.full((), 4294967295, tl.int64) - idx64
-    key = (biased << 32) + inv_idx
-    key = tl.where(valid, key, tl.full(key.shape, -9223372036854775807, tl.int64))
-    skey = tl.sort(key, descending=True)
+    if FULL_VOCAB:
+        # note (Zhang Yiyang): Neutral RL sampling needs no vocabulary sorting.
+        s_idx = idx.to(tl.int64)
+        s_valid = valid
+        final_sorted = scores
+        exact_scores = tl.div_rn(logits, safe_temp)
+        shifted = exact_scores - tl.max(exact_scores, axis=0)
+        z = tl.sum(tl.exp(shifted), axis=0)
+    else:
+        # Note (Jiaxin Deng): key packs orderable score bits above a complemented
+        # index so equal scores keep input order, matching cub's stable radix sort
+        # (torch.sort) bit-for-bit at nucleus tie boundaries. -0.0 canonicalizes to
+        # +0.0 first: the zeros compare equal numerically, so bit-distinct keys
+        # would break that input-order tie rule.
+        key_scores = tl.where(scores == 0.0, 0.0, scores)
+        bits = key_scores.to(tl.int32, bitcast=True)
+        orderable = (bits ^ ((bits >> 31) | -2147483648)).to(tl.uint32).to(tl.int64)
+        biased = orderable - tl.full((), 2147483648, tl.int64)
+        idx64 = idx.to(tl.int64)
+        inv_idx = tl.full((), 4294967295, tl.int64) - idx64
+        key = (biased << 32) + inv_idx
+        key = tl.where(valid, key, tl.full(key.shape, -9223372036854775807, tl.int64))
+        skey = tl.sort(key, descending=True)
 
-    s_idx = tl.full((), 4294967295, tl.int64) - (skey - ((skey >> 32) << 32))
-    s_bits_orderable = (skey >> 32) + tl.full((), 2147483648, tl.int64)
-    s_bits = s_bits_orderable.to(tl.int32)
-    s_bits = s_bits ^ (((~s_bits) >> 31) | -2147483648)
-    s_scores = s_bits.to(tl.float32, bitcast=True)
-    lane = tl.arange(0, BLOCK)
-    s_valid = lane < VOCAB
-    s_scores = tl.where(s_valid, s_scores, -float("inf"))
+        s_idx = tl.full((), 4294967295, tl.int64) - (skey - ((skey >> 32) << 32))
+        s_bits_orderable = (skey >> 32) + tl.full((), 2147483648, tl.int64)
+        s_bits = s_bits_orderable.to(tl.int32)
+        s_bits = s_bits ^ (((~s_bits) >> 31) | -2147483648)
+        s_scores = s_bits.to(tl.float32, bitcast=True)
+        lane = tl.arange(0, BLOCK)
+        s_valid = lane < VOCAB
+        s_scores = tl.where(s_valid, s_scores, -float("inf"))
 
-    k_active = (top_k > 0) & (top_k < VOCAB)
-    k_clamped = tl.minimum(tl.maximum(top_k, 1), VOCAB)
-    kth = tl.sum(tl.where(lane.to(tl.int64) == k_clamped - 1, s_scores, 0.0), axis=0)
-    threshold = tl.where(k_active, kth, -float("inf"))
-    masked_sorted = tl.where(s_scores < threshold, -float("inf"), s_scores)
+        k_active = (top_k > 0) & (top_k < VOCAB)
+        k_clamped = tl.minimum(tl.maximum(top_k, 1), VOCAB)
+        kth = tl.sum(
+            tl.where(lane.to(tl.int64) == k_clamped - 1, s_scores, 0.0), axis=0
+        )
+        threshold = tl.where(k_active, kth, -float("inf"))
+        masked_sorted = tl.where(s_scores < threshold, -float("inf"), s_scores)
 
-    p_active = (top_p > 0.0) & (top_p < 1.0)
-    row_max = tl.max(masked_sorted, axis=0)
-    finite_max = row_max > -float("inf")
-    # Note (Jiaxin Deng): masking on == -inf lets NaN and +inf lanes poison z the
-    # way torch.softmax poisons the baseline row, so both fall back identically.
-    exp_term = tl.where(
-        masked_sorted == -float("inf"),
-        0.0,
-        tl.exp(masked_sorted - tl.where(finite_max, row_max, 0.0)),
-    )
-    z = tl.sum(exp_term, axis=0)
-    probs_sorted = tl.where(z > 0, exp_term / z, 0.0)
-    inclusive = tl.cumsum(probs_sorted, axis=0)
-    remove = ((inclusive - probs_sorted) > top_p) & p_active
-    final_sorted = tl.where(remove, -float("inf"), masked_sorted)
+        p_active = (top_p > 0.0) & (top_p < 1.0)
+        row_max = tl.max(masked_sorted, axis=0)
+        finite_max = row_max > -float("inf")
+        # Note (Jiaxin Deng): masking on == -inf lets NaN and +inf lanes poison z the
+        # way torch.softmax poisons the baseline row, so both fall back identically.
+        exp_term = tl.where(
+            masked_sorted == -float("inf"),
+            0.0,
+            tl.exp(masked_sorted - tl.where(finite_max, row_max, 0.0)),
+        )
+        z = tl.sum(exp_term, axis=0)
+        probs_sorted = tl.where(z > 0, exp_term / z, 0.0)
+        inclusive = tl.cumsum(probs_sorted, axis=0)
+        remove = ((inclusive - probs_sorted) > top_p) & p_active
+        final_sorted = tl.where(remove, -float("inf"), masked_sorted)
 
     # Match multinomial_with_seed exactly, including hash_value == UINT32_MAX;
     # the hash keys on original token ids so lane order is irrelevant.
@@ -273,6 +287,9 @@ def fused_seeded_sample_kernel(
     use_fallback = (~do_sample) | (z <= 0) | (z != z)
     result = tl.where(use_fallback, greedy.to(tl.int64), sampled)
     tl.store(output_ptr + row, result)
+    if FULL_VOCAB:
+        selected = tl.sum(tl.where(idx == result, shifted, 0.0), axis=0)
+        tl.store(logprobs_ptr + row * LOGPROB_STRIDE, selected - tl.log(z))
 
 
 def sample_seeded_fused(
@@ -283,6 +300,7 @@ def sample_seeded_fused(
     top_k: torch.Tensor,
     seeds: torch.Tensor,
     positions: torch.Tensor,
+    full_vocab_logprobs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Single-kernel seeded sampler for vocab <= 2048.
 
@@ -291,6 +309,9 @@ def sample_seeded_fused(
     different order than aten, so at an exact nucleus boundary the kept set may
     differ by the boundary token. The tie order (input order), the greedy and
     NaN fallbacks, and the seeded draw are exact.
+
+    full_vocab_logprobs requires positive temperature and neutral top-p/top-k.
+    It records selected FP32 scores while skipping filtering and sorting.
     """
 
     rows, vocab = logits.shape
@@ -318,6 +339,11 @@ def sample_seeded_fused(
         seeds.to(torch.int64).contiguous(),
         positions.to(torch.int64).contiguous(),
         out,
+        full_vocab_logprobs,
+        LOGPROB_STRIDE=(
+            full_vocab_logprobs.stride(0) if full_vocab_logprobs is not None else 1
+        ),
+        FULL_VOCAB=full_vocab_logprobs is not None,
         VOCAB=vocab,
         ROW_STRIDE=logits.stride(0),
         BLOCK=block,

@@ -15,6 +15,7 @@ from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_fused
 from sglang_omni.models.moss_tts_prism.request_builders import PrismRequestData
 from sglang_omni.models.moss_tts_prism.rollout_trace import PRISM_STOP_THRESHOLD
 from sglang_omni.models.moss_tts_prism.sglang_model import PrismBatchInputs
+from sglang_omni.sampling.logprobs import selected_action_logprobs
 from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
@@ -140,6 +141,12 @@ class MossTTSPrismModelRunner(ModelRunner):
             if parameters["audio_repetition_penalty"] != 1.0 and data.output_codes
         ]
 
+        code_logprobs = (
+            torch.empty(batch_size, self.model.n_vq, device=device, dtype=torch.float32)
+            if self.model.enable_rl
+            else None
+        )
+
         def sample(logits: torch.Tensor, channel: int) -> torch.Tensor:
             for row, penalty, history in penalty_histories:
                 tokens = history[:, channel]
@@ -147,19 +154,32 @@ class MossTTSPrismModelRunner(ModelRunner):
                 logits[row, tokens] = torch.where(
                     scores < 0, scores * penalty, scores / penalty
                 )
-            sampler = (
-                sample_seeded_fused
-                if logits.is_cuda
-                else MossTTSModelRunner.sample_tokens
-            )
-            return sampler(
-                logits,
-                temperature=temperatures,
-                top_p=top_p,
-                top_k=top_k,
-                seeds=seeds,
-                positions=positions + channel,
-            )
+            if logits.is_cuda:
+                return sample_seeded_fused(
+                    logits,
+                    temperature=temperatures,
+                    top_p=top_p,
+                    top_k=top_k,
+                    seeds=seeds,
+                    positions=positions + channel,
+                    full_vocab_logprobs=(
+                        code_logprobs[:, channel] if code_logprobs is not None else None
+                    ),
+                )
+            else:
+                selected = MossTTSModelRunner.sample_tokens(
+                    logits,
+                    temperature=temperatures,
+                    top_p=top_p,
+                    top_k=top_k,
+                    seeds=seeds,
+                    positions=positions + channel,
+                )
+                if code_logprobs is not None:
+                    code_logprobs[:, channel] = selected_action_logprobs(
+                        logits, selected, temperatures
+                    )
+                return selected
 
         packed = {
             name: torch.cat([piece[name] for piece in pieces]).to(device)
@@ -181,14 +201,7 @@ class MossTTSPrismModelRunner(ModelRunner):
             successor_codes=packed["successor_audio_codes"],
             sample_indices=torch.tensor(indices, device=device),
             sample=sample,
-            temperature=temperatures,
-            code_logprobs=(
-                torch.empty(
-                    batch_size, self.model.n_vq, device=device, dtype=torch.float32
-                )
-                if self.model.enable_rl
-                else None
-            ),
+            code_logprobs=code_logprobs,
         )
 
     def before_prefill(
