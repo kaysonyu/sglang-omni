@@ -51,7 +51,10 @@ class PrismStreamOutputBuilder:
     def __call__(
         self, request_id: str, data: PrismRequestData, output: RequestOutput
     ) -> list[OutgoingMessage]:
-        if data.stream_metadata is None:
+        if (
+            data.stream_metadata is None
+            or output.data in data.req.sampling_params.stop_token_ids
+        ):
             return []
         codes = data.output_codes[-1]
         row = torch.cat((data.prompt["input_ids"].new_zeros(1), codes))

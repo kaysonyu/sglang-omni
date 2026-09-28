@@ -20,6 +20,8 @@ from sglang_omni.scheduling.types import (
     SchedulerRequest,
 )
 
+PRISM_STOP_THRESHOLD = 0.1
+
 
 def prism_request_inputs(
     data: PrismRequestData, config: PretrainedConfig, *, prefill: bool
@@ -209,7 +211,8 @@ class MossTTSPrismModelRunner(ModelRunner):
     ) -> None:
         cfg = self.model.config
         result.next_token_ids = torch.where(
-            result.logits_output.next_token_logits.argmax(dim=-1).bool(),
+            result.logits_output.next_token_logits.float().softmax(dim=-1)[:, 1]
+            > PRISM_STOP_THRESHOLD,
             cfg.audio_end_token_id,
             cfg.audio_assistant_gen_slot_token_id,
         )
@@ -229,6 +232,5 @@ class MossTTSPrismModelRunner(ModelRunner):
         ].cpu()
         for index, request in enumerate(scheduler_output.requests):
             data = request.data
-            # note (Zhang Yiyang): Prism's stop decision includes this frame;
-            # dropping it would truncate both full and streaming output.
-            data.output_codes.append(codes[index])
+            if outputs[request.request_id].data != self.model.config.audio_end_token_id:
+                data.output_codes.append(codes[index])

@@ -248,7 +248,7 @@ def test_stop_projection_stays_fp32_under_autocast():
         ),
     ],
 )
-def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop, device):
+def test_stop_step_is_excluded_but_length_limited_frame_is_kept(frames, stop, device):
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
@@ -258,7 +258,9 @@ def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop, device
         )
     )
     data = PrismRequestData(
-        prompt=prompt(), stream_metadata={"stream": True, "n_codebooks": 2}
+        prompt=prompt(),
+        stream_metadata={"stream": True, "n_codebooks": 2},
+        req=SimpleNamespace(sampling_params=SimpleNamespace(stop_token_ids=[9])),
     )
     request = SchedulerRequest(request_id="test", data=data)
     stream = PrismStreamOutputBuilder()
@@ -270,7 +272,7 @@ def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop, device
                     "audio_codes": torch.tensor([[index, index + 1]], device=device)
                 },
                 next_token_logits=torch.tensor(
-                    [[0.0, 1.0]] if stop and index == frames - 1 else [[1.0, 0.0]],
+                    [[0.0, 1.0]] if stop and index == frames - 1 else [[4.0, 0.0]],
                     device=device,
                 ),
             )
@@ -285,11 +287,21 @@ def test_stop_frame_and_length_limited_stream_tail_are_kept(frames, stop, device
         chunks.extend(stream("test", data, output))
     chunks.extend(stream.flush("test", data))
     assert result.next_token_ids.item() == (9 if stop else 8)
-    torch.testing.assert_close(
-        torch.cat([chunk.data[:, 1:] for chunk in chunks]),
-        torch.stack(data.output_codes),
-    )
-    assert len(data.output_codes) == frames
+    expected_frames = frames - int(stop)
+    assert len(data.output_codes) == expected_frames
+    if expected_frames:
+        torch.testing.assert_close(
+            torch.cat([chunk.data[:, 1:] for chunk in chunks]),
+            torch.stack(data.output_codes),
+        )
+    else:
+        assert chunks == []
+        from sglang_omni.models.moss_tts_prism.request_builders import (
+            apply_prism_result,
+        )
+
+        with pytest.raises(RuntimeError, match="generated no audio frames"):
+            apply_prism_result(data)
     assert stream.flush("test", data) == []
 
 
@@ -782,3 +794,54 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+def test_stop_probability_threshold_and_mixed_batch(monkeypatch, device):
+    from sglang_omni.models.moss_tts_prism import model_runner
+
+    runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
+    runner._token_id_host_bufs = None
+    runner._token_id_host_slot = 0
+    runner.model = SimpleNamespace(
+        config=SimpleNamespace(
+            audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
+        )
+    )
+    logits = torch.tensor([[4.0, 0.0], [1.0, 0.0], [0.0, 1.0]], device=device)
+    result = SimpleNamespace(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=logits,
+            customized_info={
+                "audio_codes": torch.arange(6, device=device).reshape(3, 2)
+            },
+        )
+    )
+    requests = [
+        SchedulerRequest(request_id=str(i), data=PrismRequestData()) for i in range(3)
+    ]
+    runner.post_decode(result, None, None, requests)
+    ids = runner.resolve_host_token_ids(result).tolist()
+    assert ids == [8, 9, 9]
+    outputs = {
+        str(i): RequestOutput(request_id=str(i), data=token)
+        for i, token in enumerate(ids)
+    }
+    runner.post_process_outputs(result, SimpleNamespace(requests=requests), outputs)
+    assert [len(request.data.output_codes) for request in requests] == [1, 0, 0]
+    monkeypatch.setattr(
+        model_runner, "PRISM_STOP_THRESHOLD", logits.float().softmax(-1)[1, 1].item()
+    )
+    runner.post_decode(result, None, None, requests)
+    assert runner.resolve_host_token_ids(result).tolist() == [8, 8, 9]
