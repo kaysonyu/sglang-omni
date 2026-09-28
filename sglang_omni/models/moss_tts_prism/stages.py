@@ -37,7 +37,8 @@ def create_preprocessing_executor(
     codec_model_path: str,
     device: str | None = None,
     gpu_id: int | None = None,
-    max_concurrency: int = 8,
+    max_concurrency: int = 16,
+    ref_audio_cache_max_items: int = 8192,
 ) -> SimpleScheduler:
     device = str(resolve_concrete_device(device, gpu_id))
     with moss_transformers_processor_compat():
@@ -54,7 +55,9 @@ def create_preprocessing_executor(
         attention_backend="auto",
     )
     reference = MossLocalReferenceEncoder(
-        BatchedReferenceEncoder(encoder, n_vq=config.n_vq), n_vq=config.n_vq
+        BatchedReferenceEncoder(encoder, n_vq=config.n_vq),
+        n_vq=config.n_vq,
+        max_items=ref_audio_cache_max_items,
     )
     return SimpleScheduler(
         partial(
