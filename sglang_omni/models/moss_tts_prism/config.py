@@ -63,6 +63,7 @@ class MossTTSPrismPipelineConfig(PipelineConfig):
         "tts_engine": EngineStageConfig
     }
     stages: list[StageConfig] = Field(default_factory=stages)
+    enable_rl: bool = False
     vocoder_cuda_graph: bool | None = None
     codec_model_path: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2"
     env_defaults: dict[str, str] = Field(
@@ -70,6 +71,8 @@ class MossTTSPrismPipelineConfig(PipelineConfig):
     )
 
     def stage_factory_kwargs(self, stage_name: str) -> dict[str, str | bool | None]:
+        if stage_name == "tts_engine" and self.enable_rl:
+            return {"enable_rl": True}
         if stage_name == "vocoder":
             return {
                 "codec_model_path": self.codec_model_path,

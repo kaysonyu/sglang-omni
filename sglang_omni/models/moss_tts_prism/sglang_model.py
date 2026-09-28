@@ -29,6 +29,7 @@ from sglang_omni.models.moss_tts_prism.embedding_kernels import (
     feedback_embeddings,
     input_embeddings,
 )
+from sglang_omni.sampling.logprobs import selected_action_logprobs
 
 
 class FrameSampler(Protocol):
@@ -45,6 +46,8 @@ class PrismBatchInputs:
     successor_codes: torch.Tensor
     sample_indices: torch.Tensor
     sample: FrameSampler
+    temperature: torch.Tensor | None = None
+    code_logprobs: torch.Tensor | None = None
 
 
 def prism_cache_layout(config: PretrainedConfig) -> tuple[tuple[int, int], ...]:
@@ -60,8 +63,14 @@ class PrismDecodeInputs:
     """Stable typed inputs and per-request sampling buffers for decode graphs."""
 
     def __init__(
-        self, config: PretrainedConfig, capacity: int, device: torch.device
+        self,
+        config: PretrainedConfig,
+        capacity: int,
+        device: torch.device,
+        *,
+        enable_rl: bool = False,
     ) -> None:
+        self.enable_rl = enable_rl
         self.rows = torch.zeros(
             capacity, config.n_vq + 1, dtype=torch.long, device=device
         )
@@ -129,6 +138,17 @@ class PrismDecodeInputs:
             successor_codes=self.successor_codes[:batch_size],
             sample_indices=self.sample_indices[:batch_size],
             sample=sample,
+            temperature=self.temperature[:batch_size],
+            code_logprobs=(
+                torch.empty(
+                    batch_size,
+                    self.rows.shape[1] - 1,
+                    device=self.rows.device,
+                    dtype=torch.float32,
+                )
+                if self.enable_rl
+                else None
+            ),
         )
 
 
@@ -188,6 +208,21 @@ class PrismTransformer(nn.Module):
 
 
 class MossTTSPrismSGLangModel(nn.Module):
+    enable_rl = False
+    model_identity: dict[str, str | int | bool] | None = None
+
+    def rollout_model_info(
+        self,
+    ) -> dict[str, bool | str | list[int] | dict[str, str | int | bool] | None]:
+        return {
+            "model_identity": self.model_identity,
+            "rollout_schema_versions": [2] if self.enable_rl else [],
+            "logprob_semantics": "temperature_scaled_full_vocab_v1",
+            "stop_semantics": "pre_frame_threshold_v1",
+            "supports_action_scoring": False,
+            "supports_weight_update": True,
+        }
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -335,6 +370,11 @@ class MossTTSPrismSGLangModel(nn.Module):
             (head, inputs.sample(scores.float(), head - 1))
             for head, scores in zip(heads, logits)
         ]
+        if inputs.code_logprobs is not None:
+            for scores, (head, selected) in zip(logits, sampled):
+                inputs.code_logprobs[:, head - 1] = selected_action_logprobs(
+                    scores, selected, inputs.temperature
+                )
         return stop_logits, sampled
 
     @torch.no_grad()
@@ -363,7 +403,14 @@ class MossTTSPrismSGLangModel(nn.Module):
                     )
                     return LogitsProcessorOutput(
                         next_token_logits=stop_logits[inputs.sample_indices],
-                        customized_info={"audio_codes": frames[inputs.sample_indices]},
+                        customized_info={
+                            "audio_codes": frames[inputs.sample_indices],
+                            **(
+                                {"code_logprobs": inputs.code_logprobs}
+                                if self.enable_rl
+                                else {}
+                            ),
+                        },
                     )
                 finally:
                     self.model.inputs = self.model.capture_inputs
@@ -427,7 +474,10 @@ class MossTTSPrismSGLangModel(nn.Module):
         assert stop_logits is not None
         return LogitsProcessorOutput(
             next_token_logits=stop_logits,
-            customized_info={"audio_codes": frames},
+            customized_info={
+                "audio_codes": frames,
+                **({"code_logprobs": inputs.code_logprobs} if self.enable_rl else {}),
+            },
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -478,7 +528,7 @@ class PrismPrefillBody(nn.Module):
             persistent=False,
         )
         self.capture_inputs = PrismDecodeInputs(
-            owner.config, 1, owner.device
+            owner.config, 1, owner.device, enable_rl=owner.enable_rl
         ).for_batch(1)
         self.inputs = self.capture_inputs
         self.mask[0] = True

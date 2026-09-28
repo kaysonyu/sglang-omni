@@ -759,6 +759,8 @@ class MossTTSLocalStreamingVocoderScheduler(
         self, payload: StagePayload
     ) -> tuple[MossTTSLocalState, torch.Tensor | None]:
         state = MossTTSLocalState.from_dict(payload.data)
+        if (payload.request.params or {}).get("return_audio") is False:
+            return state, None
         if state.audio_codes is None:
             if state.omni_rollout is not None:
                 return state, None
@@ -815,7 +817,10 @@ class MossTTSLocalStreamingVocoderScheduler(
             if codes is None:
                 state.audio_codes = None
                 payload.data = state.to_dict()
-                if state.omni_rollout is not None:
+                if (
+                    state.omni_rollout is not None
+                    or (payload.request.params or {}).get("return_audio") is False
+                ):
                     payload.data.update(modality="text", text="")
                 results.append(payload)
                 continue

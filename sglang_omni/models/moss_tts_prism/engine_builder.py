@@ -18,6 +18,7 @@ from sglang_omni.models.moss_tts_prism.request_builders import (
     apply_prism_result,
     build_prism_request,
 )
+from sglang_omni.models.moss_tts_prism.rollout_trace import prism_model_identity
 from sglang_omni.models.moss_tts_prism.sglang_model import (
     MossTTSPrismSGLangModel,
     PrismDecodeInputs,
@@ -37,6 +38,12 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     model_name = "MOSS-TTS Prism"
     model_arch_override = "MossTTSPrismSGLangModel"
     supports_breakable_prefill_cuda_graph = True
+
+    def __init__(
+        self, *, total_gpu_memory_fraction: float | None = None, enable_rl: bool = False
+    ) -> None:
+        super().__init__(total_gpu_memory_fraction=total_gpu_memory_fraction)
+        self.enable_rl = enable_rl
 
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | bool]:
         return {
@@ -81,11 +88,17 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     ) -> None:
         cfg = resolved_view(server_args)
         model = model_worker.model_runner.model
+        model.enable_rl = self.enable_rl
+        if self.enable_rl:
+            model.model_identity = prism_model_identity(checkpoint_dir)
         if cfg.cuda_graph_config.prefill.backend == "breakable":
             model.model = PrismPrefillBody(model, max(cfg.cuda_graph_config.prefill.bs))
         if cfg.cuda_graph_config.decode.backend != "disabled":
             model.decode_inputs = PrismDecodeInputs(
-                model.config, max(get_decode_cuda_graph_bs(server_args)), model.device
+                model.config,
+                max(get_decode_cuda_graph_bs(server_args)),
+                model.device,
+                enable_rl=self.enable_rl,
             )
 
     def post_cuda_graph_setup(

@@ -1047,7 +1047,7 @@ def register_generate(app: FastAPI) -> None:
             )
 
         request_id = str(uuid.uuid4())
-        audio_format = "wav"
+        audio_format = req.response_format
 
         try:
             gen_req = build_rollout_generate_request(req)
@@ -1113,6 +1113,11 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
     extra_params: dict[str, Any] = {
         "return_logprob": req.return_logprob,
         "return_omni_rollout": req.return_omni_rollout,
+        **(
+            {"return_audio": req.return_audio}
+            if "return_audio" in req.model_fields_set
+            else {}
+        ),
         "return_routed_experts": req.return_routed_experts,
         "return_indexer_topk": req.return_indexer_topk,
     }
@@ -1195,7 +1200,7 @@ def build_generate_response(
             ),
         )
     audio: GenerateAudio | None = None
-    if result.audio is not None:
+    if req.return_audio and result.audio is not None:
         audio = GenerateAudio(
             data=result.audio.data,
             format=audio_format,

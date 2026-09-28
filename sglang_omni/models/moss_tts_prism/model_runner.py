@@ -13,14 +13,13 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_fused
 from sglang_omni.models.moss_tts_prism.request_builders import PrismRequestData
+from sglang_omni.models.moss_tts_prism.rollout_trace import PRISM_STOP_THRESHOLD
 from sglang_omni.models.moss_tts_prism.sglang_model import PrismBatchInputs
 from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
     SchedulerRequest,
 )
-
-PRISM_STOP_THRESHOLD = 0.1
 
 
 def prism_request_inputs(
@@ -182,6 +181,14 @@ class MossTTSPrismModelRunner(ModelRunner):
             successor_codes=packed["successor_audio_codes"],
             sample_indices=torch.tensor(indices, device=device),
             sample=sample,
+            temperature=temperatures,
+            code_logprobs=(
+                torch.empty(
+                    batch_size, self.model.n_vq, device=device, dtype=torch.float32
+                )
+                if self.model.enable_rl
+                else None
+            ),
         )
 
     def before_prefill(
@@ -210,9 +217,15 @@ class MossTTSPrismModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         cfg = self.model.config
+        stop_probabilities = result.logits_output.next_token_logits.float().softmax(
+            dim=-1
+        )[:, 1]
+        if self.model.enable_rl:
+            result.logits_output.customized_info["stop_probabilities"] = (
+                stop_probabilities
+            )
         result.next_token_ids = torch.where(
-            result.logits_output.next_token_logits.float().softmax(dim=-1)[:, 1]
-            > PRISM_STOP_THRESHOLD,
+            stop_probabilities > PRISM_STOP_THRESHOLD,
             cfg.audio_end_token_id,
             cfg.audio_assistant_gen_slot_token_id,
         )
@@ -230,7 +243,15 @@ class MossTTSPrismModelRunner(ModelRunner):
         codes = result.logits_output.customized_info["audio_codes"][
             : len(scheduler_output.requests)
         ].cpu()
+        if self.model.enable_rl:
+            scores = result.logits_output.customized_info
+            stop_probabilities = scores["stop_probabilities"].detach().clone()
+            code_logprobs = scores["code_logprobs"].detach().clone()
         for index, request in enumerate(scheduler_output.requests):
             data = request.data
+            if self.model.enable_rl:
+                data.stop_probabilities.append(stop_probabilities[index])
             if outputs[request.request_id].data != self.model.config.audio_end_token_id:
                 data.output_codes.append(codes[index])
+                if self.model.enable_rl:
+                    data.code_logprobs.append(code_logprobs[index])

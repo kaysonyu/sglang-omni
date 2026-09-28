@@ -8,7 +8,9 @@ import time
 from dataclasses import dataclass, field
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import ProcessorMixin
 
@@ -24,10 +26,30 @@ from sglang_omni.models.moss_tts_local.request_builders import (
     build_moss_tts_local_stream_metadata,
 )
 from sglang_omni.models.moss_tts_local.stages import MossLocalReferenceEncoder
+from sglang_omni.models.moss_tts_prism.rollout_trace import build_prism_rollout_trace
 from sglang_omni.models.moss_tts_prism.sglang_model import MossTTSPrismSGLangModel
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.types import ARRequestData, RequestOutput
+
+
+class PrismScriptPart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1)
+    local_instruction: str | None = None
+
+
+class PrismReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+
+
+class PrismPrompt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    script: str | list[PrismScriptPart] = Field(min_length=1)
+    global_instruction: str | None = None
+    references: list[PrismReference] = Field(default_factory=list)
 
 
 @dataclass
@@ -45,6 +67,10 @@ class PrismRequestData(ARRequestData):
     stream_metadata: dict[str, int | float | str | bool] | None = None
     stream_pending_rows: list[torch.Tensor] = field(default_factory=list)
     stream_first_batch_sent: bool = False
+    code_logprobs: list[torch.Tensor] = field(default_factory=list)
+    stop_probabilities: list[torch.Tensor] = field(default_factory=list)
+    admission_weight_version: str | None = None
+    model_identity: dict[str, str | int | bool] | None = None
 
 
 class PrismStreamOutputBuilder:
@@ -164,22 +190,36 @@ def preprocess_prism_payload(
             )
     if state.language is not None:
         raise ValueError("MOSS-TTS Prism language guidance belongs in instructions")
-    reference = None
-    if state.ref_audio is not None:
-        if not isinstance(state.ref_audio, str):
+    inputs = payload.request.inputs
+    if isinstance(inputs, dict) and "script" in inputs:
+        structured = PrismPrompt.model_validate(inputs)
+        script = (
+            structured.script
+            if isinstance(structured.script, str)
+            else [part.model_dump(exclude_none=True) for part in structured.script]
+        )
+        instruction = structured.global_instruction
+        reference_uris = [reference.uri for reference in structured.references]
+    else:
+        script = state.text
+        instruction = state.instructions
+        reference_uris = [state.ref_audio] if state.ref_audio is not None else []
+    references = []
+    for uri in reference_uris:
+        if not isinstance(uri, str):
             raise ValueError(
                 "MOSS-TTS Prism reference must be a path or audio data URI"
             )
         codes = (
-            reference_encoder.encode_data_uri(state.ref_audio)
-            if _DATA_URI_RE.match(state.ref_audio)
-            else reference_encoder.encode(state.ref_audio)
+            reference_encoder.encode_data_uri(uri)
+            if _DATA_URI_RE.match(uri)
+            else reference_encoder.encode(uri)
         )
-        reference = [codes]
+        references.append(codes)
     message = processor.build_user_message(
-        script=state.text,
-        reference=reference,
-        global_instruction=state.instructions,
+        script=script,
+        reference=references or None,
+        global_instruction=instruction,
         tokens=state.token_count,
     )
     prompt = build_prism_prompt(processor, message)
@@ -196,6 +236,32 @@ def build_prism_request(
     state = MossTTSLocalState.from_dict(payload.data)
     prompt = payload.data["prism_inputs"]
     cfg = model.config
+    admission_weight_version = None
+    if model.enable_rl != state.return_omni_rollout:
+        raise ValueError(
+            "Prism RL request requires enable_rl=true and return_omni_rollout=true together"
+        )
+    if model.enable_rl:
+        if not state.return_logprob:
+            raise ValueError("Prism RL request requires return_logprob=true")
+        for name, expected in (
+            ("audio_top_p", 1.0),
+            ("audio_top_k", -1),
+            ("audio_repetition_penalty", 1.0),
+        ):
+            if state.generation_kwargs[name] != expected:
+                raise ValueError(f"Prism RL request requires {name}={expected}")
+        if (
+            not math.isfinite(state.generation_kwargs["audio_temperature"])
+            or state.generation_kwargs["audio_temperature"] <= 0
+        ):
+            raise ValueError(
+                "Prism RL request requires a finite positive audio temperature"
+            )
+        version = get_serving().weight_version
+        if version is None:
+            raise RuntimeError("Prism rollout requires a weight version")
+        admission_weight_version = str(version)
     max_new_tokens = state.generation_kwargs["max_new_tokens"]
     sampling = SamplingParams(
         max_new_tokens=max_new_tokens,
@@ -222,6 +288,8 @@ def build_prism_request(
         stage_payload=payload,
         state=state,
         prompt=prompt,
+        model_identity=model.model_identity,
+        admission_weight_version=admission_weight_version,
         sampling_seed=(
             derive_moss_tts_sampling_seed(seed)
             if seed is not None
@@ -233,17 +301,50 @@ def build_prism_request(
 
 
 def apply_prism_result(data: PrismRequestData) -> StagePayload:
-    if not data.output_codes:
+    state = data.state
+    if not data.output_codes and not state.return_omni_rollout:
         raise RuntimeError(
             "MOSS-TTS Prism generated no audio frames. Please retry the request."
         )
-    state = data.state
-    state.audio_codes = torch.stack(data.output_codes).cpu()
-    state.prompt_tokens = len(data.req.origin_input_ids)
-    state.completion_tokens = len(data.output_codes)
-    state.engine_time_s = time.perf_counter() - data.engine_start_s
     payload = data.stage_payload
     assert payload is not None
+    channels = data.prompt["input_ids"].shape[1] - 1
+    codes = (
+        torch.stack(data.output_codes).cpu()
+        if data.output_codes
+        else torch.empty((0, channels), dtype=torch.long)
+    )
+    if state.return_omni_rollout:
+        if data.admission_weight_version is None or data.weight_version is None:
+            raise RuntimeError("Prism rollout is missing its weight version")
+        if data.admission_weight_version != str(data.weight_version):
+            raise RuntimeError("Prism rollout crossed a weight update")
+        assert data.model_identity is not None
+        state.finish_reason = data.finish_reason
+        state.weight_version = str(data.weight_version)
+        state.omni_rollout = build_prism_rollout_trace(
+            prompt=data.prompt,
+            codes=codes,
+            code_logprobs=(
+                torch.stack(data.code_logprobs)
+                if data.code_logprobs
+                else torch.empty((0, channels), dtype=torch.float32)
+            ),
+            stop_probabilities=torch.stack(data.stop_probabilities),
+            finish_reason=data.finish_reason,
+            request_id=payload.request_id,
+            admission_weight_version=data.admission_weight_version,
+            model_identity=data.model_identity,
+            sampling={**state.generation_kwargs, "sampling_seed": data.sampling_seed},
+        )
+    state.audio_codes = (
+        codes
+        if len(codes) and (payload.request.params or {}).get("return_audio", True)
+        else None
+    )
+    state.prompt_tokens = len(data.prompt["input_ids"])
+    state.completion_tokens = len(codes)
+    state.engine_time_s = time.perf_counter() - data.engine_start_s
     return StagePayload(
         request_id=payload.request_id, request=payload.request, data=state.to_dict()
     )

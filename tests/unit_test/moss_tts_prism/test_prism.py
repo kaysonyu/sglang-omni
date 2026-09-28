@@ -253,9 +253,10 @@ def test_stop_step_is_excluded_but_length_limited_frame_is_kept(frames, stop, de
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
+        enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
-        )
+        ),
     )
     data = PrismRequestData(
         prompt=prompt(),
@@ -454,7 +455,11 @@ def test_sampling_tracks_request_seed_and_history_after_batch_reordering():
     config = SimpleNamespace(text_pad_idx=0, n_vq=2, prism_input_rvq_channels=(1,))
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner.model = SimpleNamespace(
-        config=config, n_vq=2, device=torch.device("cpu"), decode_inputs=None
+        enable_rl=False,
+        config=config,
+        n_vq=2,
+        device=torch.device("cpu"),
+        decode_inputs=None,
     )
     requests = []
     for index, seed in enumerate((17, 42)):
@@ -484,7 +489,7 @@ def test_decode_graph_refreshes_seed_history_and_batch_rows():
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     buffers = PrismDecodeInputs(config, 4, device)
     runner.model = SimpleNamespace(
-        config=config, n_vq=2, device=device, decode_inputs=buffers
+        enable_rl=False, config=config, n_vq=2, device=device, decode_inputs=buffers
     )
     requests = []
     for index in range(3):
@@ -657,7 +662,7 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
     model_path = os.environ.get("MOSS_TTS_PRISM_TEST_MODEL")
     if not model_path or not torch.cuda.is_available():
         pytest.skip("CUDA and MOSS_TTS_PRISM_TEST_MODEL are required")
-    scheduler = MossTTSPrismEngineBuilder().build(
+    scheduler = MossTTSPrismEngineBuilder(enable_rl=True).build(
         model_path,
         device="cuda",
         gpu_id=0,
@@ -700,6 +705,9 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
     post_prefill = runner.post_prefill
 
     def collect(result, forward_batch, schedule_batch, requests):
+        observed["logprobs"] = result.logits_output.customized_info[
+            "code_logprobs"
+        ].clone()
         observed["codes"] = result.logits_output.customized_info["audio_codes"].clone()
         observed["logits"] = result.logits_output.next_token_logits.clone()
         observed["graph"] = result.can_run_cuda_graph
@@ -716,14 +724,21 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
             input_embeds=batch.input_embeds,
         )
 
-    def run(items, seed, top_k):
+    def run(items, seed):
         requests = []
         for index, prompt in enumerate(items):
             payload = StagePayload(
                 request_id=f"prefill-{index}",
                 request=OmniRequest(
                     inputs="test",
-                    params={"seed": seed + index, "audio_top_k": top_k},
+                    params={
+                        "seed": seed + index,
+                        "audio_top_k": -1,
+                        "return_logprob": True,
+                        "return_omni_rollout": True,
+                        "audio_top_p": 1.0,
+                        "audio_temperature": 0.7 + index * 0.2,
+                    },
                 ),
                 data={},
             )
@@ -768,28 +783,28 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
             )
 
     try:
-        for items, seed, top_k in (
-            (prompts[:1], 42, 1),
-            (prompts, 17, 25),
-            (prompts[::-1][:2], 71, 25),
-            (prompts[:1], 99, 1),
+        for items, seed in (
+            (prompts[:1], 42),
+            (prompts, 17),
+            (prompts[::-1][:2], 71),
+            (prompts[:1], 99),
         ):
             with monkeypatch.context() as patch:
                 patch.setattr(graph.backend, "replay", padded_eager)
-                expected = run(items, seed, top_k)
-            actual = run(items, seed, top_k)
+                expected = run(items, seed)
+            actual = run(items, seed)
             assert actual["graph"]
-            for key in ("codes", "logits"):
+            for key in ("codes", "logits", "logprobs"):
                 torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
             for actual_kv, expected_kv in zip(actual["kv"], expected["kv"]):
                 torch.testing.assert_close(actual_kv, expected_kv, rtol=0, atol=0)
         long_batch = prompts * 3
         with monkeypatch.context() as patch:
             patch.setattr(native, "prefill_cuda_graph_runner", None)
-            expected = run(long_batch, 42, 25)
-        actual = run(long_batch, 42, 25)
+            expected = run(long_batch, 42)
+        actual = run(long_batch, 42)
         assert not actual["graph"]
-        for key in ("codes", "logits"):
+        for key in ("codes", "logits", "logprobs"):
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
     finally:
         if torch.distributed.is_initialized():
@@ -815,9 +830,10 @@ def test_stop_probability_threshold_and_mixed_batch(monkeypatch, device):
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
+        enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
-        )
+        ),
     )
     logits = torch.tensor([[4.0, 0.0], [1.0, 0.0], [0.0, 1.0]], device=device)
     result = SimpleNamespace(

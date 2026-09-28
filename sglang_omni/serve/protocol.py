@@ -247,6 +247,8 @@ class RolloutGenerateRequest(BaseModel):
 
     return_logprob: bool = True
     return_omni_rollout: bool = False
+    return_audio: bool = Field(default=True, strict=True)
+    response_format: Literal["wav", "flac"] = "wav"
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
 
