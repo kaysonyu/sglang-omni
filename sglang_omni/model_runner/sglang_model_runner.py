@@ -513,6 +513,16 @@ class SGLModelRunner(ModelRunner):
         )
 
         if (
+            self._model_arch_override == "MossTTSPrismSGLangModel"
+            and get_exec().graph.cuda_graph_config.prefill.backend
+            == CudaGraphBackend.BREAKABLE
+        ):
+            from sglang_omni.models.moss_tts_prism.prefill_cuda_graph import (
+                PrismPrefillCudaGraphRunner,
+            )
+
+            return PrismPrefillCudaGraphRunner
+        if (
             self._model_arch_override == "WhisperForConditionalGeneration"
             and get_exec().graph.cuda_graph_config.prefill.backend
             == CudaGraphBackend.BREAKABLE

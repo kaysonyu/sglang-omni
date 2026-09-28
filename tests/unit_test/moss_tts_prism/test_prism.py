@@ -142,6 +142,7 @@ def embedding_model():
         text_pad_idx=0, prism_input_rvq_channels=(1,), embedding_head_usage="untied"
     )
     model.decode_inputs = None
+    model.model = None
     model.n_vq = 2
     model.transformer = nn.Module()
     model.transformer.embed_tokens = nn.Embedding.from_pretrained(
@@ -394,6 +395,10 @@ def test_pipeline_registers_separate_architecture_with_decode_graphs(
     )
     assert config.architecture == "MossTTSPrismModel"
     assert not config.stage_named("tts_engine").engine.disable_cuda_graph
+    assert (
+        config.stage_named("tts_engine").engine.cuda_graph_backend_prefill
+        == "breakable"
+    )
     assert config.stage_named("tts_engine").stream_to == ["vocoder"]
     assert config.stage_factory_kwargs("vocoder") == {
         "codec_model_path": config.codec_model_path,
@@ -617,3 +622,163 @@ def test_fused_embeddings_match_eager_and_graph_replay(dtype, rows, hidden):
     graph.replay()
     for actual, expected in zip(outputs, eager()):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.accelerator
+def test_prefill_graph_replays_live_requests(monkeypatch):
+    import os
+
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.common import release_kv_cache
+    from transformers import AutoConfig, AutoTokenizer
+
+    from sglang_omni.models.moss_tts.hf_loading import (
+        load_moss_processor_class,
+        moss_transformers_processor_compat,
+    )
+    from sglang_omni.models.moss_tts_local.request_builders import (
+        build_moss_tts_local_state,
+    )
+    from sglang_omni.models.moss_tts_prism.request_builders import build_prism_request
+    from sglang_omni.scheduling.types import SchedulerOutput
+
+    model_path = os.environ.get("MOSS_TTS_PRISM_TEST_MODEL")
+    if not model_path or not torch.cuda.is_available():
+        pytest.skip("CUDA and MOSS_TTS_PRISM_TEST_MODEL are required")
+    scheduler = MossTTSPrismEngineBuilder().build(
+        model_path,
+        device="cuda",
+        gpu_id=0,
+        server_args_overrides={
+            "max_total_tokens": 8192,
+            "context_length": 4096,
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": [64, 128, 256],
+        },
+    )
+    runner = scheduler._model_runner
+    native = runner.tp_worker.model_runner
+    model = runner.model
+    graph = native.prefill_cuda_graph_runner
+    assert graph is not None
+    with moss_transformers_processor_compat():
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        processor = load_moss_processor_class(model_path)(
+            tokenizer=AutoTokenizer.from_pretrained(model_path, trust_remote_code=True),
+            audio_tokenizer=None,
+            model_config=config,
+        )
+    prompts = []
+    for length in (7, 11, 19):
+        codes = torch.arange(length * config.n_vq).reshape(length, config.n_vq)
+        prompts.append(
+            build_prism_prompt(
+                processor,
+                processor.build_user_message(
+                    script="The train crossed the river as the city came to life.",
+                    reference=[codes % config.speech_vocab_size],
+                ),
+            )
+        )
+    capacity = (
+        scheduler.req_to_token_pool.available_size(),
+        scheduler.token_to_kv_pool_allocator.available_size(),
+    )
+    observed = {}
+    post_prefill = runner.post_prefill
+
+    def collect(result, forward_batch, schedule_batch, requests):
+        observed["codes"] = result.logits_output.customized_info["audio_codes"].clone()
+        observed["logits"] = result.logits_output.next_token_logits.clone()
+        observed["graph"] = result.can_run_cuda_graph
+        post_prefill(result, forward_batch, schedule_batch, requests)
+
+    monkeypatch.setattr(runner, "post_prefill", collect)
+
+    def padded_eager(shape_key, batch, **kwargs):
+        return type(model.model).forward(
+            model.model,
+            batch.input_ids,
+            batch.positions,
+            batch,
+            input_embeds=batch.input_embeds,
+        )
+
+    def run(items, seed, top_k):
+        requests = []
+        for index, prompt in enumerate(items):
+            payload = StagePayload(
+                request_id=f"prefill-{index}",
+                request=OmniRequest(
+                    inputs="test",
+                    params={"seed": seed + index, "audio_top_k": top_k},
+                ),
+                data={},
+            )
+            state = build_moss_tts_local_state(payload)
+            payload.data = {**state.to_dict(), "prism_inputs": prompt}
+            data = build_prism_request(payload, model=model)
+            scheduler.normalize_req_token_arrays(data.req)
+            data.req.init_next_round_input(scheduler.tree_cache)
+            data.req.set_extend_range(0, len(prompt["input_ids"]))
+            requests.append(SchedulerRequest(request_id=payload.request_id, data=data))
+        batch = ScheduleBatch.init_new(
+            [request.data.req for request in requests],
+            scheduler.req_to_token_pool,
+            scheduler.token_to_kv_pool_allocator,
+            scheduler.tree_cache,
+            scheduler.model_config,
+            enable_overlap=False,
+            spec_algorithm=scheduler.spec_algorithm,
+        )
+        try:
+            batch.prepare_for_extend()
+            runner.execute(SchedulerOutput(requests=requests, batch_data=batch))
+            result = dict(observed)
+            result["kv"] = [
+                buffer[batch.out_cache_loc].clone()
+                for layer in range(model.end_layer)
+                for buffer in (
+                    native.token_to_kv_pool.get_key_buffer(layer),
+                    native.token_to_kv_pool.get_value_buffer(layer),
+                )
+            ]
+            assert model.batch_inputs is None
+            assert model.model.inputs is model.model.capture_inputs
+            return result
+        finally:
+            for request in requests:
+                if request.data.req.kv.holds_kv:
+                    release_kv_cache(request.data.req, scheduler.tree_cache)
+            assert capacity == (
+                scheduler.req_to_token_pool.available_size(),
+                scheduler.token_to_kv_pool_allocator.available_size(),
+            )
+
+    try:
+        for items, seed, top_k in (
+            (prompts[:1], 42, 1),
+            (prompts, 17, 25),
+            (prompts[::-1][:2], 71, 25),
+            (prompts[:1], 99, 1),
+        ):
+            with monkeypatch.context() as patch:
+                patch.setattr(graph.backend, "replay", padded_eager)
+                expected = run(items, seed, top_k)
+            actual = run(items, seed, top_k)
+            assert actual["graph"]
+            for key in ("codes", "logits"):
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+            for actual_kv, expected_kv in zip(actual["kv"], expected["kv"]):
+                torch.testing.assert_close(actual_kv, expected_kv, rtol=0, atol=0)
+        long_batch = prompts * 3
+        with monkeypatch.context() as patch:
+            patch.setattr(native, "prefill_cuda_graph_runner", None)
+            expected = run(long_batch, 42, 25)
+        actual = run(long_batch, 42, 25)
+        assert not actual["graph"]
+        for key in ("codes", "logits"):
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

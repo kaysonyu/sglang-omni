@@ -21,6 +21,7 @@ from sglang_omni.models.moss_tts_prism.request_builders import (
 from sglang_omni.models.moss_tts_prism.sglang_model import (
     MossTTSPrismSGLangModel,
     PrismDecodeInputs,
+    PrismPrefillBody,
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
@@ -35,7 +36,7 @@ class PrismResultAdapter(Protocol):
 class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     model_name = "MOSS-TTS Prism"
     model_arch_override = "MossTTSPrismSGLangModel"
-    supports_breakable_prefill_cuda_graph = False
+    supports_breakable_prefill_cuda_graph = True
 
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | bool]:
         return {
@@ -51,11 +52,11 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
             raise ValueError("MOSS-TTS Prism currently requires TP=1 and PP=1")
         if (
             cfg.cuda_graph_config.decode.backend not in ("disabled", "full")
-            or cfg.cuda_graph_config.prefill.backend != "disabled"
+            or cfg.cuda_graph_config.prefill.backend not in ("disabled", "breakable")
             or cfg.enable_torch_compile
         ):
             raise ValueError(
-                "MOSS-TTS Prism supports full decode graphs and eager prefill only, without torch.compile"
+                "MOSS-TTS Prism supports full decode graphs and eager or breakable prefill, without torch.compile"
             )
         if not cfg.disable_radix_cache or cfg.chunked_prefill_size > 0:
             raise ValueError(
@@ -78,8 +79,11 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         gpu_id: int,
         server_args: ServerArgs,
     ) -> None:
-        if resolved_view(server_args).cuda_graph_config.decode.backend != "disabled":
-            model = model_worker.model_runner.model
+        cfg = resolved_view(server_args)
+        model = model_worker.model_runner.model
+        if cfg.cuda_graph_config.prefill.backend == "breakable":
+            model.model = PrismPrefillBody(model, max(cfg.cuda_graph_config.prefill.bs))
+        if cfg.cuda_graph_config.decode.backend != "disabled":
             model.decode_inputs = PrismDecodeInputs(
                 model.config, max(get_decode_cuda_graph_bs(server_args)), model.device
             )

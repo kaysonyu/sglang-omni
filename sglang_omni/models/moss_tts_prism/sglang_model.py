@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import copy
+import weakref
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -12,7 +14,11 @@ import torch.nn.functional as F
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Attention, Qwen3MLP
 from torch import nn
@@ -218,6 +224,7 @@ class MossTTSPrismSGLangModel(nn.Module):
         self.end_layer = len(prism_cache_layout(config))
         self.batch_inputs: PrismBatchInputs | None = None
         self.decode_inputs: PrismDecodeInputs | None = None
+        self.model: PrismPrefillBody | None = None
 
     @property
     def device(self) -> torch.device:
@@ -264,6 +271,72 @@ class MossTTSPrismSGLangModel(nn.Module):
             ) * active.unsqueeze(-1)
         return hidden
 
+    def execute_schedule(
+        self,
+        hidden: torch.Tensor,
+        apply_range: Callable[[int, int, torch.Tensor], torch.Tensor],
+        read_site: Callable[[int, torch.Tensor], torch.Tensor | None],
+    ) -> torch.Tensor:
+        """Run shared physical blocks with per-application residual coupling."""
+        incoming = None
+        index = 0
+        units = self.topology.execution_units
+        while index < len(units):
+            unit = units[index]
+            if unit.kind == "ordinary":
+                value = hidden if incoming is None else hidden + incoming
+                hidden = apply_range(unit.layer_start, unit.layer_stop, value)
+                incoming = read_site(index, hidden)
+                index += 1
+                continue
+
+            stop = index + 1
+            while (
+                stop < len(units)
+                and units[stop].kind == "loop"
+                and units[stop].index == unit.index
+            ):
+                stop += 1
+            block_input = hidden
+            accumulated = incoming
+            for application in range(index, stop):
+                # note (Zhang Yiyang): Repeated blocks add the original block input;
+                # RVQ deltas accumulate separately from this residual.
+                value = block_input if application == index else hidden + block_input
+                if accumulated is not None:
+                    value = value + accumulated
+                hidden = apply_range(unit.layer_start, unit.layer_stop, value)
+                incoming = read_site(application, hidden)
+                if self.topology.reapply_rvq_conditioning_in_loop:
+                    if incoming is not None:
+                        accumulated = (
+                            incoming if accumulated is None else accumulated + incoming
+                        )
+                else:
+                    accumulated = incoming
+            index = stop
+        return hidden
+
+    def sample_audio_heads(
+        self, index: int, hidden: torch.Tensor, inputs: PrismBatchInputs
+    ) -> tuple[torch.Tensor | None, list[tuple[int, torch.Tensor]]]:
+        heads = self.topology.execution_units[index].rvq_heads
+        normalized = self.prediction_norms[
+            self.topology.prediction_norm_index_by_execution_unit[index]
+        ](hidden[inputs.sample_indices])
+        stop_logits = None
+        if 1 in heads:
+            with torch.autocast(device_type=normalized.device.type, enabled=False):
+                stop_logits = F.linear(
+                    normalized.float(), self.stop_head.weight.float()
+                )
+        logits = [self.audio_lm_heads[head - 1](normalized) for head in heads]
+        sampled = [
+            (head, inputs.sample(scores.float(), head - 1))
+            for head, scores in zip(heads, logits)
+        ]
+        return stop_logits, sampled
+
     @torch.no_grad()
     def forward(
         self,
@@ -273,6 +346,27 @@ class MossTTSPrismSGLangModel(nn.Module):
         input_embeds: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
         inputs = self.batch_inputs
+        if self.model is not None and forward_batch.forward_mode.is_extend():
+            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+                is_in_breakable_cuda_graph,
+            )
+
+            if is_in_breakable_cuda_graph():
+                assert inputs is not None
+                self.model.prepare(inputs)
+                try:
+                    frames, stop_logits = self.model(
+                        input_ids,
+                        positions,
+                        forward_batch,
+                        input_embeds=self.prepare_inputs(inputs),
+                    )
+                    return LogitsProcessorOutput(
+                        next_token_logits=stop_logits[inputs.sample_indices],
+                        customized_info={"audio_codes": frames[inputs.sample_indices]},
+                    )
+                finally:
+                    self.model.inputs = self.model.capture_inputs
         if self.decode_inputs is not None and forward_batch.forward_mode.is_decode():
             inputs = self.decode_inputs.for_batch(input_ids.numel())
         assert inputs is not None
@@ -288,95 +382,48 @@ class MossTTSPrismSGLangModel(nn.Module):
         stop_logits = None
         cache_slot = 0
 
-        incoming = None
-        index = 0
-        units = self.topology.execution_units
-        while index < len(units):
-            unit = units[index]
-            is_loop = unit.kind == "loop"
-            stop = index + 1
-            if is_loop:
-                while (
-                    stop < len(units)
-                    and units[stop].kind == "loop"
-                    and units[stop].index == unit.index
-                ):
-                    stop += 1
-            block_input = hidden
-            accumulated = incoming
-            for application in range(index, stop):
-                if is_loop:
-                    # note (Zhang Yiyang): Repeated blocks reuse their original
-                    # input residual and accumulate RVQ feedback separately.
-                    hidden = (
-                        block_input if application == index else hidden + block_input
-                    )
-                    if accumulated is not None:
-                        hidden = hidden + accumulated
-                elif incoming is not None:
-                    hidden = hidden + incoming
+        def apply_range(start: int, stop: int, value: torch.Tensor) -> torch.Tensor:
+            nonlocal cache_slot
+            for index in range(start, stop):
+                layer = self.transformer.layers[index]
+                if not layer.mlp_only:
+                    # note (Zhang Yiyang): A reused physical attention layer
+                    # needs a distinct KV slot for each scheduled invocation.
+                    layer.self_attn.attn.layer_id = cache_slot
+                    cache_slot += 1
+                value = layer(value, positions, forward_batch)
+            return value
 
-                for layer_index in range(unit.layer_start, unit.layer_stop):
-                    layer = self.transformer.layers[layer_index]
-                    if not layer.mlp_only:
-                        # note (Zhang Yiyang): Each invocation of a reused
-                        # attention layer needs its own KV history.
-                        layer.self_attn.attn.layer_id = cache_slot
-                        cache_slot += 1
-                    hidden = layer(hidden, positions, forward_batch)
+        def read_site(index: int, value: torch.Tensor) -> torch.Tensor | None:
+            nonlocal stop_logits
+            heads = self.topology.execution_units[index].rvq_heads
+            if not heads:
+                return None
+            site_stop_logits, sampled = self.sample_audio_heads(index, value, inputs)
+            if site_stop_logits is not None:
+                stop_logits = site_stop_logits
+            for head, selected in sampled:
+                frames[:, head - 1] = selected
+                codes[inputs.sample_indices, head - 1] = selected
+            if index == len(self.topology.execution_units) - 1:
+                return None
+            if codes.is_cuda:
+                return feedback_embeddings(
+                    codes,
+                    mask,
+                    tuple(self.audio_weight(head - 1) for head in heads),
+                    tuple(head - 1 for head in heads),
+                )
+            delta = None
+            for head in heads:
+                embedding = F.embedding(
+                    codes[:, head - 1].masked_fill(~mask, 0),
+                    self.audio_weight(head - 1),
+                ) * mask.unsqueeze(-1)
+                delta = embedding if delta is None else delta + embedding
+            return delta
 
-                incoming = None
-                heads = units[application].rvq_heads
-                if heads:
-                    normalized = self.prediction_norms[
-                        self.topology.prediction_norm_index_by_execution_unit[
-                            application
-                        ]
-                    ](hidden[inputs.sample_indices])
-                    if 1 in heads:
-                        with torch.autocast(
-                            device_type=normalized.device.type, enabled=False
-                        ):
-                            stop_logits = F.linear(
-                                normalized.float(), self.stop_head.weight.float()
-                            )
-                    logits = [
-                        self.audio_lm_heads[head - 1](normalized) for head in heads
-                    ]
-                    for head, scores in zip(heads, logits):
-                        selected = inputs.sample(scores.float(), head - 1)
-                        frames[:, head - 1] = selected
-                        codes[inputs.sample_indices, head - 1] = selected
-                    if application != len(units) - 1:
-                        if codes.is_cuda:
-                            incoming = feedback_embeddings(
-                                codes,
-                                mask,
-                                tuple(self.audio_weight(head - 1) for head in heads),
-                                tuple(head - 1 for head in heads),
-                            )
-                        else:
-                            for head in heads:
-                                embedding = F.embedding(
-                                    codes[:, head - 1].masked_fill(~mask, 0),
-                                    self.audio_weight(head - 1),
-                                ) * mask.unsqueeze(-1)
-                                incoming = (
-                                    embedding
-                                    if incoming is None
-                                    else incoming + embedding
-                                )
-                if is_loop:
-                    if self.topology.reapply_rvq_conditioning_in_loop:
-                        if incoming is not None:
-                            accumulated = (
-                                incoming
-                                if accumulated is None
-                                else accumulated + incoming
-                            )
-                    else:
-                        accumulated = incoming
-            index = stop
+        self.execute_schedule(hidden, apply_range, read_site)
         assert stop_logits is not None
         return LogitsProcessorOutput(
             next_token_logits=stop_logits,
@@ -402,6 +449,109 @@ class MossTTSPrismSGLangModel(nn.Module):
                 param = params[name]
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, weight)
+
+
+class PrismAttentionSlot(nn.Module):
+    def __init__(self, attention: RadixAttention, slot: int) -> None:
+        super().__init__()
+        # note (Zhang Yiyang): BCG needs immutable metadata for each repeated call.
+        self.attn = copy.copy(attention)
+        self.attn.layer_id = slot
+
+
+class PrismPrefillBody(nn.Module):
+    def __init__(self, owner: MossTTSPrismSGLangModel, capacity: int) -> None:
+        super().__init__()
+        self.owner_ref = weakref.ref(owner)
+        self.layers = nn.ModuleList(
+            PrismAttentionSlot(owner.transformer.layers[layer].self_attn.attn, slot)
+            for slot, (_, layer) in enumerate(prism_cache_layout(owner.config))
+        )
+        self.register_buffer(
+            "codes",
+            torch.zeros(capacity, owner.n_vq, dtype=torch.long, device=owner.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "mask",
+            torch.zeros(capacity, dtype=torch.bool, device=owner.device),
+            persistent=False,
+        )
+        self.capture_inputs = PrismDecodeInputs(
+            owner.config, 1, owner.device
+        ).for_batch(1)
+        self.inputs = self.capture_inputs
+        self.mask[0] = True
+
+    def prepare(self, inputs: PrismBatchInputs) -> None:
+        self.inputs = inputs
+        length = inputs.rows.shape[0]
+        self.codes[:length].copy_(inputs.successor_codes)
+        self.mask.zero_()
+        self.mask[:length].copy_(inputs.successor_mask)
+        self.mask.index_fill_(0, inputs.sample_indices, True)
+
+    @eager_on_graph(True)
+    def read_site(
+        self,
+        index: int,
+        hidden: torch.Tensor,
+        codes: torch.Tensor,
+        mask: torch.Tensor,
+        frames: torch.Tensor,
+        stop_logits: torch.Tensor,
+    ) -> torch.Tensor | None:
+        owner = self.owner_ref()
+        inputs = self.inputs
+        heads = owner.topology.execution_units[index].rvq_heads
+        site_stop_logits, sampled = owner.sample_audio_heads(index, hidden, inputs)
+        if site_stop_logits is not None:
+            stop_logits[inputs.sample_indices] = site_stop_logits
+        for head, selected in sampled:
+            frames[inputs.sample_indices, head - 1] = selected
+            codes[inputs.sample_indices, head - 1] = selected
+        if index == len(owner.topology.execution_units) - 1:
+            return None
+        return feedback_embeddings(
+            codes,
+            mask,
+            tuple(owner.audio_weight(head - 1) for head in heads),
+            tuple(head - 1 for head in heads),
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        owner = self.owner_ref()
+        count = input_ids.numel()
+        codes = self.codes[:count].clone()
+        mask = self.mask[:count]
+        frames = torch.zeros_like(codes)
+        stop_logits = torch.zeros(count, 2, dtype=torch.float32, device=codes.device)
+        slot = 0
+
+        def apply_range(start: int, stop: int, hidden: torch.Tensor) -> torch.Tensor:
+            nonlocal slot
+            for index in range(start, stop):
+                layer = owner.transformer.layers[index]
+                if not layer.mlp_only:
+                    layer.self_attn.attn.layer_id = slot
+                    slot += 1
+                hidden = layer(hidden, positions, forward_batch)
+            return hidden
+
+        def read_site(index: int, hidden: torch.Tensor) -> torch.Tensor | None:
+            if not owner.topology.execution_units[index].rvq_heads:
+                return None
+            return self.read_site(index, hidden, codes, mask, frames, stop_logits)
+
+        owner.execute_schedule(input_embeds, apply_range, read_site)
+        return frames, stop_logits
 
 
 EntryClass = MossTTSPrismSGLangModel
