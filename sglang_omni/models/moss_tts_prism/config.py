@@ -86,4 +86,36 @@ class MossTTSPrismPipelineConfig(PipelineConfig):
         return True
 
 
+class MossTTSPrismScorePipelineConfig(PipelineConfig):
+    """Frozen teacher scoring without reference encoding or audio synthesis."""
+
+    architecture: ClassVar[str] = "MossTTSPrismModel"
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "tts_engine": EngineStageConfig
+    }
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: [
+            EngineStageConfig(
+                name="tts_engine",
+                process="teacher",
+                gpu=0,
+                gpu_memory_fraction=0.5,
+                terminal=True,
+                factory_path=f"{PKG}.engine_builder.create_score_engine",
+                factory=FactoryArgs(dtype="bfloat16", score_chunk_size=128),
+                engine=EngineArgs(
+                    disable_cuda_graph=True,
+                    disable_radix_cache=True,
+                    chunked_prefill_size=-1,
+                ),
+            )
+        ]
+    )
+
+
 EntryClass = MossTTSPrismPipelineConfig
+
+Variants = {
+    "default": MossTTSPrismPipelineConfig,
+    "score": MossTTSPrismScorePipelineConfig,
+}

@@ -21,7 +21,7 @@ from sglang_omni.models.moss_tts_local.scoring_protocol import (
 )
 from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.serve.local_scoring import register_local_scoring
+from sglang_omni.serve.action_scoring import register_action_scoring
 
 
 def score_input(**kwargs):
@@ -195,7 +195,7 @@ def test_teacher_batch_endpoint_returns_input_order():
 
     app = FastAPI()
     app.state.client = ScoreClient()
-    register_local_scoring(app)
+    register_action_scoring(app)
     samples = [
         score_input().model_dump(),
         score_input().model_copy(update={"sample_id": "second"}).model_dump(),

@@ -75,4 +75,42 @@ finish reason, server request ID, model identity, and admission weight version.
 modeling, and processor files. A request whose final weight version differs from
 its admission version fails instead of returning a successful trace.
 
-Prism teacher scoring and full disk/NCCL update validation are separate work.
+## Frozen teacher scoring
+
+Start a separate teacher with `examples/configs/moss_tts_prism_score.yaml`,
+setting `model_path` to its checkpoint. It uses the same Prism model and execution
+schedule, with one prefill-only engine and no codec, vocoder, or CUDA graphs.
+
+Send up to 64 samples to `POST /score_actions`. Build each sample from a rollout:
+
+```python
+sample = {
+    "version": 1,
+    "sample_id": "sample-001",
+    **trace["replay_inputs"],
+    "codes": trace["action_streams"][0]["actions"],
+    "finish_reason": trace["finish_reason"],
+    "temperature": 0.7,
+}
+response = requests.post(teacher_url + "/score_actions", json={"samples": [sample]})
+```
+
+The teacher forces the supplied codes without sampling or applying its stop
+threshold. Each result contains selected `code_logprobs` of shape `[frames, n_vq]`
+and the original `stop_probabilities`. Temperature scales only the RVQ logits.
+Natural stops include the final stop observation; length-limited trajectories
+do not. Zero-frame natural stops return an empty code score list and one stop
+probability. Stop probabilities remain observations, not action logprobs.
+
+Results preserve input order and carry `sample_id`, `input_sha256`, model identity,
+and the teacher's weight version and parameter checksum. The input hash covers
+canonical validated JSON excluding `sample_id`. `/model_info` advertises scoring
+support and the same checksum reported by `/weights_checker?action=checksum`;
+runtime caches are excluded. The teacher remains fixed during training.
+
+`tts_engine.factory.score_chunk_size` bounds the number of prediction states
+projected through each scoring head at once (default 128). Scores come from the
+teacher's BF16 replay and need not match the student's recorded behavior scores,
+even for equal checkpoint weights, because the execution shapes differ.
+
+Full Prism disk/NCCL student update validation remains separate work.

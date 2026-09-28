@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -35,14 +35,22 @@ class FrameSampler(Protocol):
     def __call__(self, logits: torch.Tensor, channel: int) -> torch.Tensor: ...
 
 
+class PrismPredictionSite(Protocol):
+    def __call__(self, index: int, hidden: torch.Tensor) -> torch.Tensor | None: ...
+
+
 @dataclass(kw_only=True)
-class PrismBatchInputs:
+class PrismInputs:
     rows: torch.Tensor
     item_kind: torch.Tensor
     audio_role: torch.Tensor
     retention: torch.Tensor
     successor_mask: torch.Tensor
     successor_codes: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class PrismBatchInputs(PrismInputs):
     sample_indices: torch.Tensor
     sample: FrameSampler
     code_logprobs: torch.Tensor | None = None
@@ -211,18 +219,29 @@ class PrismTransformer(nn.Module):
 
 class MossTTSPrismSGLangModel(nn.Module):
     enable_rl = False
+    teacher_weight_sha256: str | None = None
+    teacher_weight_version: str | None = None
     model_identity: dict[str, str | int | bool] | None = None
 
     def rollout_model_info(
         self,
     ) -> dict[str, bool | str | list[int] | dict[str, str | int | bool] | None]:
+        is_teacher = self.teacher_weight_sha256 is not None
         return {
             "model_identity": self.model_identity,
-            "rollout_schema_versions": [2] if self.enable_rl else [],
+            "rollout_schema_versions": [2] if self.enable_rl or is_teacher else [],
             "logprob_semantics": "temperature_scaled_full_vocab_v1",
             "stop_semantics": "pre_frame_threshold_v1",
-            "supports_action_scoring": False,
-            "supports_weight_update": True,
+            "supports_action_scoring": is_teacher,
+            "supports_weight_update": not is_teacher,
+            **(
+                {
+                    "teacher_weight_sha256": self.teacher_weight_sha256,
+                    "weight_version": self.teacher_weight_version,
+                }
+                if is_teacher
+                else {}
+            ),
         }
 
     packed_modules_mapping = {
@@ -276,7 +295,7 @@ class MossTTSPrismSGLangModel(nn.Module):
             return self.audio_lm_heads[channel].weight
         return self.audio_embeddings[channel].weight
 
-    def prepare_inputs(self, inputs: PrismBatchInputs) -> torch.Tensor:
+    def prepare_inputs(self, inputs: PrismInputs) -> torch.Tensor:
         if inputs.rows.is_cuda:
             return input_embeddings(
                 inputs.rows,
@@ -311,10 +330,25 @@ class MossTTSPrismSGLangModel(nn.Module):
     def execute_schedule(
         self,
         hidden: torch.Tensor,
-        apply_range: Callable[[int, int, torch.Tensor], torch.Tensor],
-        read_site: Callable[[int, torch.Tensor], torch.Tensor | None],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        read_site: PrismPredictionSite,
     ) -> torch.Tensor:
         """Run shared physical blocks with per-application residual coupling."""
+        cache_slot = 0
+
+        def apply_range(start: int, stop: int, value: torch.Tensor) -> torch.Tensor:
+            nonlocal cache_slot
+            for index in range(start, stop):
+                layer = self.transformer.layers[index]
+                if not layer.mlp_only:
+                    # note (Zhang Yiyang): A reused physical attention layer
+                    # needs a distinct KV slot for each scheduled invocation.
+                    layer.self_attn.attn.layer_id = cache_slot
+                    cache_slot += 1
+                value = layer(value, positions, forward_batch)
+            return value
+
         incoming = None
         index = 0
         units = self.topology.execution_units
@@ -424,19 +458,6 @@ class MossTTSPrismSGLangModel(nn.Module):
             device=hidden.device,
         )
         stop_logits = None
-        cache_slot = 0
-
-        def apply_range(start: int, stop: int, value: torch.Tensor) -> torch.Tensor:
-            nonlocal cache_slot
-            for index in range(start, stop):
-                layer = self.transformer.layers[index]
-                if not layer.mlp_only:
-                    # note (Zhang Yiyang): A reused physical attention layer
-                    # needs a distinct KV slot for each scheduled invocation.
-                    layer.self_attn.attn.layer_id = cache_slot
-                    cache_slot += 1
-                value = layer(value, positions, forward_batch)
-            return value
 
         def read_site(index: int, value: torch.Tensor) -> torch.Tensor | None:
             nonlocal stop_logits
@@ -467,7 +488,7 @@ class MossTTSPrismSGLangModel(nn.Module):
                 delta = embedding if delta is None else delta + embedding
             return delta
 
-        self.execute_schedule(hidden, apply_range, read_site)
+        self.execute_schedule(hidden, positions, forward_batch, read_site)
         assert stop_logits is not None
         return LogitsProcessorOutput(
             next_token_logits=stop_logits,
@@ -580,24 +601,13 @@ class PrismPrefillBody(nn.Module):
         mask = self.mask[:count]
         frames = torch.zeros_like(codes)
         stop_logits = torch.zeros(count, 2, dtype=torch.float32, device=codes.device)
-        slot = 0
-
-        def apply_range(start: int, stop: int, hidden: torch.Tensor) -> torch.Tensor:
-            nonlocal slot
-            for index in range(start, stop):
-                layer = owner.transformer.layers[index]
-                if not layer.mlp_only:
-                    layer.self_attn.attn.layer_id = slot
-                    slot += 1
-                hidden = layer(hidden, positions, forward_batch)
-            return hidden
 
         def read_site(index: int, hidden: torch.Tensor) -> torch.Tensor | None:
             if not owner.topology.execution_units[index].rvq_heads:
                 return None
             return self.read_site(index, hidden, codes, mask, frames, stop_logits)
 
-        owner.execute_schedule(input_embeds, apply_range, read_site)
+        owner.execute_schedule(input_embeds, positions, forward_batch, read_site)
         return frames, stop_logits
 
 
