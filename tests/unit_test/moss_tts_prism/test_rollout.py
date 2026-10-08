@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from sglang_omni.client.client import Client
 from sglang_omni.models.moss_tts_prism.config import MossTTSPrismPipelineConfig
 from sglang_omni.models.moss_tts_prism.model_runner import MossTTSPrismModelRunner
 from sglang_omni.models.moss_tts_prism.request_builders import (
@@ -25,6 +26,7 @@ from sglang_omni.models.moss_tts_prism.sglang_model import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput, SchedulerRequest
+from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
 @pytest.fixture
@@ -68,10 +70,20 @@ def test_trace_preserves_carrier_and_only_counts_rvq_actions(carrier, frames, fi
         assert trace["replay_inputs"][name] == carrier[name].tolist()
 
 
-def test_identity_hashes_original_artifact_bytes(tmp_path):
-    config = {"n_vq": 3, "speech_vocab_size": 17, "sampling_rate": 24000}
+@pytest.mark.parametrize("revision", [4, 6, 7, 42])
+def test_identity_hashes_original_artifact_bytes(tmp_path, revision):
+    config = {
+        "n_vq": 3,
+        "speech_vocab_size": 17,
+        "sampling_rate": 24000,
+        "prompt_renderer_revision": revision,
+    }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    for filename in ("modeling_moss_tts.py", "processing_moss_tts.py"):
+    for filename in (
+        "modeling_moss_tts.py",
+        "processing_moss_tts.py",
+        "prompt_protocol.py",
+    ):
         (tmp_path / filename).write_text("original\n")
     first = prism_model_identity(str(tmp_path))
     (tmp_path / "config.json").write_text(json.dumps(config, indent=2))
@@ -81,6 +93,17 @@ def test_identity_hashes_original_artifact_bytes(tmp_path):
     assert first["n_vq"] == 3
     assert first["audio_vocab_size"] == 17
     assert first["sample_rate"] == 24000
+
+    assert len(first["prompt_protocol_sha256"]) == 64
+    (tmp_path / "prompt_protocol.py").write_text("updated renderer")
+    changed = prism_model_identity(str(tmp_path))
+    assert changed["prompt_protocol_sha256"] != second["prompt_protocol_sha256"]
+    assert changed["config_sha256"] == second["config_sha256"]
+    config["prompt_renderer_revision"] = 3
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "prompt_protocol.py").unlink()
+    with pytest.raises(FileNotFoundError, match="prompt_protocol"):
+        prism_model_identity(str(tmp_path))
 
 
 def test_rl_switch_defaults_off():
@@ -330,19 +353,37 @@ def test_prompt_matches_artifact_typed_carrier():
         def encode(self, uri):
             return references[int(uri)]
 
-    for script, count in [
-        ("Hello.", 0),
+        def encode_data_uri(self, uri):
+            return references[0]
+
+    for task, script, count, instruction in [
+        ("TTS", "Hello.", 0, None),
+        ("Instruction", "Hello.", 0, '{"Speed":"slow"}'),
+        ("Full VoiceClone", "Hello.", 1, None),
+        ("Attribute Clone Triplet", "Hello.", 2, None),
+        ("sing clone", "Hello.", 1, None),
         (
-            [
-                {"text": "Hello.", "local_instruction": "Speak softly."},
-                {"text": "Goodbye."},
-            ],
-            2,
+            "Local Instruction",
+            "Hello. Goodbye.",
+            0,
+            json.dumps(
+                {
+                    "global instruction": {"Speed": "slow"},
+                    "local instruction": [
+                        {"text": "Goodbye.", "local instruction": {"Emotion": "sad"}}
+                    ],
+                }
+            ),
         ),
     ]:
         inputs = {
             "script": script,
-            "global_instruction": "Speak clearly.",
+            "task_type": task,
+            "show_language": True,
+            "language": "English",
+            "tokens_control": True,
+            "global_tokens": 120,
+            "global_instruction": instruction,
             "references": [
                 {"id": f"audio{i + 1}", "uri": str(i)} for i in range(count)
             ],
@@ -356,8 +397,49 @@ def test_prompt_matches_artifact_typed_carrier():
         )
         message = processor.build_user_message(
             script=script,
-            global_instruction="Speak clearly.",
+            task_type=task,
+            language="English",
+            tokens=120,
+            global_instruction=instruction,
             reference=references[:count] or None,
+        )
+        expected = processor([[message]], mode="generation")
+        for name, actual in prepared.data["prism_inputs"].items():
+            torch.testing.assert_close(actual, expected[name][0], rtol=0, atol=0)
+
+    service = SpeechRequestValidator(default_model="prism")
+    reference_uri = "data:audio/wav;base64,UklGRg=="
+    for fields, task in [
+        ({}, "TTS"),
+        ({"instructions": '{"Speed":"slow"}'}, "Instruction"),
+        ({"ref_audio": reference_uri}, "Full VoiceClone"),
+        (
+            {"ref_audio": reference_uri, "instructions": '{"Emotion":"happy"}'},
+            "Instruction Voice Clone",
+        ),
+    ]:
+        speech = service.parse_generation_request(
+            {"input": "Hello.", "language": "English", "token_count": 120, **fields}
+        )
+        request = Client.build_omni_request(
+            service.build_generate_request(
+                speech.request,
+                validate=False,
+                reference_descriptors=speech.reference_descriptors,
+            )
+        )
+        prepared = preprocess_prism_payload(
+            StagePayload(request_id="speech", request=request, data={}),
+            processor=processor,
+            reference_encoder=ReferenceEncoder(),
+        )
+        message = processor.build_user_message(
+            script="Hello.",
+            task_type=task,
+            language="English",
+            tokens=120,
+            global_instruction=fields.get("instructions"),
+            reference=references[:1] if "ref_audio" in fields else None,
         )
         expected = processor([[message]], mode="generation")
         for name, actual in prepared.data["prism_inputs"].items():

@@ -8,7 +8,11 @@ endpoint, full RVQ channels, TP1, and the checkpoint's complete execution schedu
 
 ```json
 {
-  "prompt": {"script": "Please read this sentence."},
+  "prompt": {
+    "script": "Please read this sentence.",
+    "task_type": "TTS",
+    "show_language": false
+  },
   "sampling_params": {
     "temperature": 0.7,
     "top_p": 1.0,
@@ -27,12 +31,34 @@ endpoint, full RVQ channels, TP1, and the checkpoint's complete execution schedu
 
 Both return flags are required on an RL instance. Temperature must be finite and
 positive; top-p, top-k, and repetition penalty must have the neutral values above.
-`max_new_tokens` counts emitted frames. `script` also accepts a list of
-`{"text": "...", "local_instruction": "..."}` objects. Optional
+`max_new_tokens` counts emitted frames. Structured prompts use a fixed contract with a
+single transcript string, an explicit `task_type`, and a boolean `show_language`.
+When `show_language` is true, `language` must be provided. Optional
 `global_instruction` and ordered `references: [{"id": "audio1", "uri": "..."}]`
 are rendered by the checkpoint processor. Reference URIs are local paths or audio
-data URIs; their order determines audio1, audio2, and so on. Language guidance
-continues to belong in the instruction, as in ordinary Prism serving.
+data URIs; their order determines audio1, audio2, and so on. For duration
+conditioning, set `tokens_control: true` and a positive `global_tokens` in the
+prompt. This condition is independent of the generation limit.
+
+Every request uses the same processor arguments: `script`, encoded `reference`,
+`global_instruction`, `task_type`, `language`, and `tokens`. The service validates
+field types and control dependencies; the checkpoint processor validates task
+support and renders text. `prompt_renderer_revision` is recorded as provenance
+and does not select request fields. Checkpoints must include `prompt_protocol.py`
+and preserve the typed input layout. Script lists and revision-3 processors
+require their frozen runtime snapshots.
+
+Ordinary `/v1/audio/speech` requests, including streaming requests, are adapted
+to this contract. Plain strings and generic `text`/`input` dictionaries use `TTS`
+by default, or `Instruction` when instructions are present. A single reference
+uses `Full VoiceClone`, or `Instruction Voice Clone` with instructions. The
+speech task `Base` uses those defaults; `VoiceDesign` maps to `Instruction`.
+Instructions are forwarded unchanged and must satisfy the checkpoint's JSON
+instruction format. Explicit language and duration controls are carried into
+the structured prompt; `Auto` omits language guidance. Multiple references and
+other explicit Prism task selections should use a structured prompt. A prompt
+containing `script` always receives strict validation and cannot fall back to
+the generic input format when required fields are missing.
 
 `return_audio: false` skips vocoder decoding and returns `audio: null` with the
 complete trace. It does not unload the codec. With audio enabled, `response_format`
@@ -72,7 +98,7 @@ change the original length distribution.
 The trace includes effective sampling parameters, the resolved sampling seed,
 finish reason, server request ID, model identity, and admission weight version.
 `/model_info` exposes the same identity, hashing the original configuration,
-modeling, and processor files. A request whose final weight version differs from
+modeling, processor, and prompt protocol files. A request whose final weight version differs from
 its admission version fails instead of returning a successful trace.
 
 ## Frozen teacher scoring

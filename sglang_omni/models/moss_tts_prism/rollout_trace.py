@@ -15,6 +15,9 @@ PRISM_STOP_THRESHOLD = 0.1
 def prism_model_identity(checkpoint_dir: str) -> dict[str, str | int | bool]:
     artifact = Path(checkpoint_dir)
     config = json.loads((artifact / "config.json").read_bytes())
+    revision = config.get("prompt_renderer_revision")
+    if type(revision) is not int or revision < 1:
+        raise ValueError("Prism checkpoint must record a positive renderer revision")
     return {
         "policy_family": "moss_tts_prism",
         "architecture": "MOSS-TTS-Prism",
@@ -24,6 +27,7 @@ def prism_model_identity(checkpoint_dir: str) -> dict[str, str | int | bool]:
                 ("config_sha256", "config.json"),
                 ("modeling_sha256", "modeling_moss_tts.py"),
                 ("processor_sha256", "processing_moss_tts.py"),
+                ("prompt_protocol_sha256", "prompt_protocol.py"),
             )
         },
         "n_vq": config["n_vq"],
