@@ -162,6 +162,7 @@ class RolloutSamplingParams(BaseModel):
     stop: str | list[str] | None = None
     stop_token_ids: list[int] | None = None
     seed: int | None = None
+    stop_sampling: bool | None = Field(default=None, strict=True)
     max_new_tokens: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
 

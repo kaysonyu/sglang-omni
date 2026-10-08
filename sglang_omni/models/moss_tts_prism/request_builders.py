@@ -75,12 +75,15 @@ class PrismRequestData(ARRequestData):
     prompt: dict[str, torch.Tensor] = field(default_factory=dict)
     output_codes: list[torch.Tensor] = field(default_factory=list)
     sampling_seed: int = field(default_factory=new_moss_tts_sampling_seed)
+    stop_sampling: bool = False
     engine_start_s: float = 0.0
     stream_metadata: dict[str, int | float | str | bool] | None = None
     stream_pending_rows: list[torch.Tensor] = field(default_factory=list)
     stream_first_batch_sent: bool = False
     code_logprobs: list[torch.Tensor] = field(default_factory=list)
     stop_probabilities: list[torch.Tensor] = field(default_factory=list)
+    stop_actions: list[torch.Tensor] = field(default_factory=list)
+    stop_logprobs: list[torch.Tensor] = field(default_factory=list)
     admission_weight_version: str | None = None
     model_identity: dict[str, str | int | bool] | None = None
 
@@ -180,6 +183,10 @@ def preprocess_prism_payload(
     state = build_moss_tts_local_state(payload)
     params = dict(payload.request.params or {})
     params.update((params.get("stage_params") or {}).get("tts_engine") or {})
+    stop_sampling = params.get("stop_sampling", False)
+    if type(stop_sampling) is not bool:
+        raise ValueError("MOSS-TTS Prism stop_sampling must be a boolean")
+    state.generation_kwargs["stop_sampling"] = stop_sampling
     for name in ("audio_temperature", "audio_top_p", "audio_repetition_penalty"):
         if not math.isfinite(state.generation_kwargs[name]):
             raise ValueError(f"MOSS-TTS Prism {name} must be finite")
@@ -331,6 +338,7 @@ def build_prism_request(
         req=req,
         stage_payload=payload,
         state=state,
+        stop_sampling=state.generation_kwargs.get("stop_sampling", False),
         prompt=prompt,
         model_identity=model.model_identity,
         admission_weight_version=admission_weight_version,
@@ -375,11 +383,21 @@ def apply_prism_result(data: PrismRequestData) -> StagePayload:
                 else torch.empty((0, channels), dtype=torch.float32)
             ),
             stop_probabilities=torch.stack(data.stop_probabilities),
+            stop_actions=(
+                torch.stack(data.stop_actions) if data.stop_sampling else None
+            ),
+            stop_logprobs=(
+                torch.stack(data.stop_logprobs) if data.stop_sampling else None
+            ),
             finish_reason=data.finish_reason,
             request_id=payload.request_id,
             admission_weight_version=data.admission_weight_version,
             model_identity=data.model_identity,
-            sampling={**state.generation_kwargs, "sampling_seed": data.sampling_seed},
+            sampling={
+                **state.generation_kwargs,
+                "stop_sampling": data.stop_sampling,
+                "sampling_seed": data.sampling_seed,
+            },
         )
     state.audio_codes = (
         codes

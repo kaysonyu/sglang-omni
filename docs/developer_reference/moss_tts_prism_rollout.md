@@ -72,7 +72,8 @@ pre-generation `prompt_rows`, `item_kind`, `audio_role`, `successor_audio_mask`,
 `successor_audio_codes`, and `target_history_retention_mask`. The original target
 anchor is preserved; no KV state is serialized.
 
-`action_streams` contains only `codes`: `[frames, n_vq]` actions, selected FP32
+With default threshold stopping, `action_streams` contains only `codes`:
+`[frames, n_vq]` actions, selected FP32
 `log_softmax(logits / temperature)` scores, and all-one action masks. The total
 action count is `frames * n_vq`. Scores are collected in eager, full decode CUDA
 Graph, and breakable prefill execution, using the live request's temperature and
@@ -94,6 +95,28 @@ observation than emitted frames. A length cap has exactly one observation per
 frame, without an extra terminal query. Immediate stop is a valid zero-frame
 rollout with one observation and no audio. RL does not force a first frame or
 change the original length distribution.
+
+Set `sampling_params.stop_sampling: true` to sample the binary stop/continue
+decision instead. The request resolves this mode once; mixed batches apply it
+per request. Stop sampling uses temperature 1, no vocabulary truncation, a seed
+derived separately from the RVQ seed, and the emitted-frame counter. The same
+seeded sampler handles RVQ and stop; enabling RL recording preserves the sampled
+actions. Only sampled requests contribute stop actions and scores to the trace.
+
+Stage overrides use `stage_sampling.tts_engine.stop_sampling` or
+`stage_params.tts_engine.stop_sampling`. The latter takes precedence, followed by
+stage sampling, then top-level sampling; an explicit `false` overrides `true`.
+Speech requests can set this option through `stage_params.tts_engine` as well.
+
+This mode declares `stop_semantics: pre_frame_bernoulli_v1` and adds a
+`stop_decisions` stream containing actions `0` (continue) and `1` (stop), with
+their selected behavior logprobs. Natural stopping records `F + 1` decisions;
+the length limit records `F`. The total action count includes these decisions.
+Immediate stop is a valid RL response with empty `[0, n_vq]` code actions,
+`stop_decisions: [1]` and `audio: null`. Consumers should retain this sampled
+outcome in their rewards and policy objective. Ordinary serving can use the
+same sampling mode without recording scores; a zero-frame audio-only request
+retains the existing retry error.
 
 The trace includes effective sampling parameters, the resolved sampling seed,
 finish reason, server request ID, model identity, and admission weight version.

@@ -32,6 +32,8 @@ from sglang_omni.models.moss_tts_prism.sglang_model import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput, SchedulerRequest
+from sglang_omni.serve.openai_api import build_rollout_generate_request
+from sglang_omni.serve.protocol import RolloutGenerateRequest
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
@@ -365,6 +367,33 @@ def test_preprocess_uses_prism_prompt_fields():
         [5, 0, 0],
     ]
     assert prepared.data["generation_kwargs"]["seed"] == 42
+    sampled_payload = StagePayload(
+        request_id="sampled",
+        request=OmniRequest(
+            inputs=inputs,
+            params={
+                "stop_sampling": True,
+                "return_omni_rollout": True,
+                "return_logprob": True,
+            },
+        ),
+        data={},
+    )
+    sampled = preprocess_prism_payload(
+        sampled_payload, processor=Processor(), reference_encoder=None
+    )
+    assert sampled.data["generation_kwargs"]["stop_sampling"] is True
+    inference = preprocess_prism_payload(
+        StagePayload(
+            request_id="inference",
+            request=OmniRequest(inputs=inputs, params={"stop_sampling": True}),
+            data={},
+        ),
+        processor=Processor(),
+        reference_encoder=None,
+    )
+    assert inference.data["generation_kwargs"]["stop_sampling"] is True
+    assert inference.data.get("return_omni_rollout", False) is False
 
 
 @pytest.fixture
@@ -384,6 +413,91 @@ def speech_processor() -> SimpleNamespace:
         _normalize_user=lambda message: message,
         _replace_placeholders=lambda content, references, **kwargs: content,
     )
+
+
+@pytest.mark.parametrize("top_level_mode", [None, False, True])
+@pytest.mark.parametrize("stage_sampling_mode", [None, False, True])
+@pytest.mark.parametrize("stage_params_mode", [None, False, True])
+def test_rollout_stop_sampling_respects_stage_precedence(
+    speech_processor: SimpleNamespace,
+    top_level_mode: bool | None,
+    stage_sampling_mode: bool | None,
+    stage_params_mode: bool | None,
+) -> None:
+    rollout_request = RolloutGenerateRequest(
+        prompt={"script": "hello", "task_type": "TTS", "show_language": False},
+        sampling_params={"stop_sampling": top_level_mode},
+        stage_sampling={"tts_engine": {"stop_sampling": stage_sampling_mode}},
+        stage_params=(
+            {"tts_engine": {"stop_sampling": stage_params_mode}}
+            if stage_params_mode is not None
+            else None
+        ),
+    )
+    request = Client.build_omni_request(build_rollout_generate_request(rollout_request))
+    prepared = preprocess_prism_payload(
+        StagePayload(request_id="stop-precedence", request=request, data={}),
+        processor=speech_processor,
+        reference_encoder=None,
+    )
+    if stage_params_mode is not None:
+        expected = stage_params_mode
+    elif stage_sampling_mode is not None:
+        expected = stage_sampling_mode
+    elif top_level_mode is not None:
+        expected = top_level_mode
+    else:
+        expected = False
+    assert prepared.data["generation_kwargs"]["stop_sampling"] is expected
+
+
+@pytest.mark.parametrize("invalid_mode", ["true", 1, None])
+def test_preprocess_rejects_non_boolean_stage_stop_sampling(
+    speech_processor: SimpleNamespace, invalid_mode: str | int | None
+) -> None:
+    request = OmniRequest(
+        inputs="hello",
+        params={
+            "stop_sampling": True,
+            "stage_params": {"tts_engine": {"stop_sampling": invalid_mode}},
+        },
+    )
+    with pytest.raises(ValueError, match="stop_sampling must be a boolean"):
+        preprocess_prism_payload(
+            StagePayload(request_id="invalid-stop-mode", request=request, data={}),
+            processor=speech_processor,
+            reference_encoder=None,
+        )
+    speech_processor.build_user_message.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("stop_sampling", [False, True])
+def test_speech_stop_sampling_uses_stage_params(
+    speech_processor: SimpleNamespace, stream: bool, stop_sampling: bool
+) -> None:
+    service = SpeechRequestValidator(default_model="prism")
+    speech = service.parse_generation_request(
+        {
+            "input": "hello",
+            "stream": stream,
+            "response_format": "pcm" if stream else "wav",
+            "stage_params": {"tts_engine": {"stop_sampling": stop_sampling}},
+        }
+    )
+    request = Client.build_omni_request(
+        service.build_generate_request(
+            speech.request,
+            validate=False,
+            reference_descriptors=speech.reference_descriptors,
+        )
+    )
+    prepared = preprocess_prism_payload(
+        StagePayload(request_id="speech-stop-mode", request=request, data={}),
+        processor=speech_processor,
+        reference_encoder=None,
+    )
+    assert prepared.data["generation_kwargs"]["stop_sampling"] is stop_sampling
 
 
 @pytest.mark.parametrize("stream", [False, True])

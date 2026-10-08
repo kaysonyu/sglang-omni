@@ -22,6 +22,43 @@ from sglang_omni.scheduling.types import (
     SchedulerRequest,
 )
 
+STOP_SAMPLING_SEED_XOR = 0x45D9F3B
+
+
+def sample_prism_tokens(
+    logits: torch.Tensor,
+    *,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: torch.Tensor,
+    seeds: torch.Tensor,
+    positions: torch.Tensor,
+    logprob_output: torch.Tensor | None,
+) -> torch.Tensor:
+    """Sample RVQ or stop actions with optional full-vocabulary scores."""
+    if logits.is_cuda:
+        return sample_seeded_fused(
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seeds=seeds,
+            positions=positions,
+            full_vocab_logprobs=logprob_output,
+        )
+    else:
+        actions = MossTTSModelRunner.sample_tokens(
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seeds=seeds,
+            positions=positions,
+        )
+        if logprob_output is not None:
+            logprob_output.copy_(selected_action_logprobs(logits, actions, temperature))
+        return actions
+
 
 def prism_request_inputs(
     data: PrismRequestData, config: PretrainedConfig, *, prefill: bool
@@ -154,32 +191,17 @@ class MossTTSPrismModelRunner(ModelRunner):
                 logits[row, tokens] = torch.where(
                     scores < 0, scores * penalty, scores / penalty
                 )
-            if logits.is_cuda:
-                return sample_seeded_fused(
-                    logits,
-                    temperature=temperatures,
-                    top_p=top_p,
-                    top_k=top_k,
-                    seeds=seeds,
-                    positions=positions + channel,
-                    full_vocab_logprobs=(
-                        code_logprobs[:, channel] if code_logprobs is not None else None
-                    ),
-                )
-            else:
-                selected = MossTTSModelRunner.sample_tokens(
-                    logits,
-                    temperature=temperatures,
-                    top_p=top_p,
-                    top_k=top_k,
-                    seeds=seeds,
-                    positions=positions + channel,
-                )
-                if code_logprobs is not None:
-                    code_logprobs[:, channel] = selected_action_logprobs(
-                        logits, selected, temperatures
-                    )
-                return selected
+            return sample_prism_tokens(
+                logits,
+                temperature=temperatures,
+                top_p=top_p,
+                top_k=top_k,
+                seeds=seeds,
+                positions=positions + channel,
+                logprob_output=(
+                    code_logprobs[:, channel] if code_logprobs is not None else None
+                ),
+            )
 
         packed = {
             name: torch.cat([piece[name] for piece in pieces]).to(device)
@@ -230,15 +252,67 @@ class MossTTSPrismModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         cfg = self.model.config
-        stop_probabilities = result.logits_output.next_token_logits.float().softmax(
-            dim=-1
-        )[:, 1]
+        stop_logits = result.logits_output.next_token_logits.float()
+        stop_probabilities = stop_logits.softmax(dim=-1)[:, 1]
         if self.model.enable_rl:
             result.logits_output.customized_info["stop_probabilities"] = (
                 stop_probabilities
             )
+        sampled_indices = [
+            index
+            for index, request in enumerate(requests)
+            if request.data.stop_sampling
+        ]
+        stop_actions = (stop_probabilities > PRISM_STOP_THRESHOLD).long()
+        if sampled_indices:
+            device = stop_logits.device
+            count = len(sampled_indices)
+            ones = torch.ones(count, dtype=torch.float32, device=device)
+            seeds = torch.tensor(
+                [
+                    requests[index].data.sampling_seed ^ STOP_SAMPLING_SEED_XOR
+                    for index in sampled_indices
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+            positions = torch.tensor(
+                [len(requests[index].data.output_codes) for index in sampled_indices],
+                dtype=torch.long,
+                device=device,
+            )
+            if count == len(requests):
+                selected_logits = stop_logits
+            else:
+                indices = torch.tensor(sampled_indices, device=device, dtype=torch.long)
+                selected_logits = stop_logits.index_select(0, indices)
+            selected_logprobs = (
+                torch.empty(count, dtype=torch.float32, device=device)
+                if self.model.enable_rl
+                else None
+            )
+            sampled_actions = sample_prism_tokens(
+                selected_logits,
+                temperature=ones,
+                top_p=ones,
+                top_k=torch.full((count,), -1, dtype=torch.long, device=device),
+                seeds=seeds,
+                positions=positions,
+                logprob_output=selected_logprobs,
+            )
+            if count == len(requests):
+                stop_actions = sampled_actions
+            else:
+                stop_actions.index_copy_(0, indices, sampled_actions)
+            if self.model.enable_rl:
+                result.logits_output.customized_info["sampled_stop_actions"] = (
+                    sampled_actions
+                )
+                result.logits_output.customized_info["sampled_stop_logprobs"] = (
+                    selected_logprobs
+                )
         result.next_token_ids = torch.where(
-            stop_probabilities > PRISM_STOP_THRESHOLD,
+            stop_actions.bool(),
             cfg.audio_end_token_id,
             cfg.audio_assistant_gen_slot_token_id,
         )
@@ -260,6 +334,19 @@ class MossTTSPrismModelRunner(ModelRunner):
             scores = result.logits_output.customized_info
             stop_probabilities = scores["stop_probabilities"].detach().clone()
             code_logprobs = scores["code_logprobs"].detach().clone()
+            sampled_requests = [
+                request.data
+                for request in scheduler_output.requests
+                if request.data.stop_sampling
+            ]
+            if sampled_requests:
+                stop_actions = scores["sampled_stop_actions"].detach().clone()
+                stop_logprobs = scores["sampled_stop_logprobs"].detach().clone()
+                for data, action, logprob in zip(
+                    sampled_requests, stop_actions, stop_logprobs, strict=True
+                ):
+                    data.stop_actions.append(action)
+                    data.stop_logprobs.append(logprob)
         for index, request in enumerate(scheduler_output.requests):
             data = request.data
             if self.model.enable_rl:
