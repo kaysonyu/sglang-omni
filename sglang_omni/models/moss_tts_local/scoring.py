@@ -227,7 +227,7 @@ class LocalScoreModelRunner(ModelRunner):
             }
 
 
-class TeacherWeightChecker(StrictWeightChecker):
+class LocalTeacherWeightChecker(StrictWeightChecker):
     @staticmethod
     def iter_named_tensors(model: Any):
         # note (Zhang Yiyang): Decode staging is not part of the checkpoint.
@@ -280,6 +280,9 @@ class LocalScoreEngineBuilder(MossTtsLocalEngineBuilder):
             raise ValueError("Local teacher scoring requires unquantized weights")
         self.model.score_only = True
         self.model.score_context_length = self.context_length
+        model_worker._strict_weight_checker = LocalTeacherWeightChecker(
+            model_worker.model_runner
+        )
 
     def make_model_runner(
         self, model_worker: Any, output_proc: Any
@@ -297,7 +300,7 @@ class LocalScoreEngineBuilder(MossTtsLocalEngineBuilder):
     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
         from sglang.srt.runtime_context import get_serving
 
-        digest = TeacherWeightChecker(SimpleNamespace(model=self.model)).checksum()
+        digest = LocalTeacherWeightChecker(SimpleNamespace(model=self.model)).checksum()
         self.model.teacher_weight_sha256 = digest["per_gpu_checksum"]
         self.model.teacher_weight_version = str(
             get_serving().weight_version or self.model.teacher_weight_sha256
