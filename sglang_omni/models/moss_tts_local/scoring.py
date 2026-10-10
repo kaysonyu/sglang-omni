@@ -280,6 +280,9 @@ class LocalScoreEngineBuilder(MossTtsLocalEngineBuilder):
             raise ValueError("Local teacher scoring requires unquantized weights")
         self.model.score_only = True
         self.model.score_context_length = self.context_length
+        model_worker._strict_weight_checker = TeacherWeightChecker(
+            model_worker.model_runner
+        )
 
     def make_model_runner(
         self, model_worker: Any, output_proc: Any
