@@ -56,6 +56,7 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
+    "MossTTSPrismSGLangModel": ("language_config", None),
     "MossTranscribeDiarizeForConditionalGeneration": ("text_config", None),
 }
 
@@ -187,6 +188,17 @@ class ModelWorker:
         # note(ratish): SGLang sizes the KV pool from the larger of these two
         # and set the second from the root text config at construction.
         model_config.num_attention_layers = text_cfg.num_hidden_layers
+        if arch == "MossTTSPrismSGLangModel":
+            from sglang_omni.models.moss_tts_prism.sglang_model import (
+                prism_cache_layout,
+            )
+
+            cache_layers = len(prism_cache_layout(model_config.hf_config))
+            model_config.num_hidden_layers = cache_layers
+            model_config.num_attention_layers = cache_layers
+            model_config.head_dim = int(text_cfg.head_dim)
+            model_config.v_head_dim = model_config.head_dim
+            model_config.vocab_size = int(text_cfg.vocab_size)
         if arch == "MingTTSSGLangModel":
             model_config.head_dim = int(text_cfg.head_dim)
             model_config.v_head_dim = model_config.head_dim
@@ -390,7 +402,7 @@ class ModelWorker:
     def model_info(self) -> dict[str, Any]:
         from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 
-        return {
+        info = {
             "model_path": get_model().model_path,
             "load_format": get_model().load_format,
             "weight_version": get_serving().weight_version,
@@ -401,6 +413,10 @@ class ModelWorker:
             "supports_weight_checker": True,
             "prefill_cuda_graph": self.prefill_cuda_graph_info(),
         }
+        describe = getattr(self.model_runner.model, "rollout_model_info", None)
+        if describe is not None:
+            info.update(describe())
+        return info
 
     def update_weights_from_disk(self, payload: dict[str, Any]) -> tuple[bool, str]:
         model_path = payload.get("model_path")

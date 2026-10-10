@@ -37,6 +37,7 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
         self,
         *,
         enable_async_decode: bool,
+        enable_rl: bool = False,
         async_decode_min_batch_size: int,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
@@ -44,6 +45,7 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
         codec_mem_reserve: float,
         process_total_gpu_memory_fraction: float | None = None,
     ) -> None:
+        self.enable_rl = enable_rl
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.prefill_coalesce_requests = prefill_coalesce_requests
@@ -140,6 +142,8 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
     ) -> None:
         del checkpoint_dir, device, gpu_id, server_args
         self.model = model_worker.model_runner.model
+        if self.enable_rl:
+            self.model.enable_rl = True
 
     def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
         from sglang_omni.scheduling.generation_batch_policy import (

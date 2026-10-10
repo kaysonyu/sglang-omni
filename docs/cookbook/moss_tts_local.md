@@ -75,6 +75,52 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.wav
 ```
 
+
+### Structured prompts with a v2 checkpoint
+
+A checkpoint whose `model_config.prompt_protocol` is `moss_tts_v2` accepts a
+structured prompt through the generic `/generate` endpoint:
+
+```json
+{
+  "prompt": {
+    "script": [
+      {"text": "Hello, welcome back.", "local_instruction": "Speak warmly."},
+      {"text": "Here is today's update."}
+    ],
+    "global_instruction": "Use a relaxed, natural voice.",
+    "references": [
+      {"id": "speaker", "uri": "/path/to/speaker.wav"},
+      {"id": "style", "uri": "/path/to/style.wav"}
+    ]
+  },
+  "sampling_params": {"max_new_tokens": 256}
+}
+```
+
+`script` is a nonempty string or a nonempty list of segments, each containing
+`text` and an optional `local_instruction`. `global_instruction` accepts a string
+or a JSON object; objects are serialized as deterministic JSON before being
+passed to the processor. Optional `references` use unique `id` values and `uri`
+values containing a server-readable path, URL, or audio data URI. All references
+are encoded and passed to the processor in request order. Reference IDs identify
+request entries; their order determines the audio slots supplied to the renderer.
+Optional `language` is retained as request metadata. Duration controls use the
+existing `tokens`, `token_count`, or `duration_tokens` parameters under
+`stage_params.tts_engine`.
+
+The Local preprocessing stage validates this contract and calls the loaded
+checkpoint's `build_user_message(script=..., reference=...,
+global_instruction=..., tokens=...)`, then its generation processor. The
+checkpoint owns prompt rendering and its renderer revision; the serving adapter
+does not translate renderer versions. A structured Local prompt requires a v2
+processor and cannot mix legacy `text` input, `instructions`/`instruct` parameters,
+or legacy reference fields with the structured fields. Unknown fields and
+malformed references fail validation.
+
+The plain-text and v1.5 speech examples in this page remain supported. Prism uses
+its own structured prompt schema and preprocessing path.
+
 ### Voice Cloning
 
 Provide a reference clip when you want voice cloning. The `references` field accepts `audio_path`

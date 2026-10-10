@@ -607,6 +607,7 @@ def create_sglang_tts_engine_executor(
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
     enable_async_decode: bool = False,
+    enable_rl: bool = False,
     async_decode_min_batch_size: int = 2,
     prefill_coalesce_requests: int = 0,
     prefill_coalesce_wait_ms: float = 60.0,
@@ -620,6 +621,7 @@ def create_sglang_tts_engine_executor(
 
     return MossTtsLocalEngineBuilder(
         enable_async_decode=enable_async_decode,
+        enable_rl=enable_rl,
         async_decode_min_batch_size=async_decode_min_batch_size,
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,

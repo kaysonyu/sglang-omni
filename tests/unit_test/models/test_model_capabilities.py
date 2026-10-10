@@ -72,6 +72,14 @@ EXPECTED_MODEL_CAPABILITIES = {
         supports_torch_compile=True,
         supports_breakable_prefill_cuda_graph=False,
     ),
+    "MossTTSPrismModel": ModelCapabilities(
+        supports_reference_audio=True,
+        supports_batch_vocoder=True,
+        supports_streaming_vocoder=True,
+        supports_cuda_graph=True,
+        supports_torch_compile=False,
+        supports_breakable_prefill_cuda_graph=True,
+    ),
     "FishQwen3OmniForCausalLM": ModelCapabilities(
         supports_reference_audio=True,
         supports_batch_vocoder=True,

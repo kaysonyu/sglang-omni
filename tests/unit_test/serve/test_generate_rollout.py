@@ -6,8 +6,10 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
+from sglang_omni.client.client import Client
 from sglang_omni.client.types import (
     CompletionAudio,
     CompletionResult,
@@ -437,6 +439,42 @@ def test_converter_omits_explicit_params_when_sampling_omitted() -> None:
     assert EXPLICIT_GENERATION_PARAMS_KEY not in gen.metadata
 
 
+@pytest.mark.parametrize("stop_sampling", [False, True])
+def test_converter_routes_sampled_stop_only_when_requested(
+    stop_sampling: bool,
+) -> None:
+    sampled = build_rollout_generate_request(
+        RolloutRequest(
+            prompt={"script": "hello"},
+            sampling_params={"stop_sampling": stop_sampling},
+            return_omni_rollout=True,
+        )
+    )
+    assert sampled.extra_params["stop_sampling"] is stop_sampling
+    assert Client.build_omni_request(sampled).params["stop_sampling"] is stop_sampling
+    ordinary = build_rollout_generate_request(RolloutRequest(prompt="hello"))
+    assert "stop_sampling" not in ordinary.extra_params
+
+
+def test_converter_preserves_stage_params_when_routing_stop_sampling() -> None:
+    request = RolloutRequest(
+        prompt="hello",
+        stage_sampling={"tts_engine": {"stop_sampling": False, "temperature": 0.7}},
+        stage_params={
+            "tts_engine": {"max_new_tokens": 12},
+            "vocoder": {"initial_codec_chunk_frames": 3},
+        },
+    )
+    original = request.model_dump()
+    converted = Client.build_omni_request(build_rollout_generate_request(request))
+    assert converted.params["stage_params"] == {
+        "tts_engine": {"max_new_tokens": 12, "stop_sampling": False},
+        "vocoder": {"initial_codec_chunk_frames": 3},
+    }
+    assert converted.params["stage_sampling"]["tts_engine"]["temperature"] == 0.7
+    assert request.model_dump() == original
+
+
 def test_converter_preserves_explicit_rollout_sampling_default_values() -> None:
     req = RolloutRequest(
         prompt="hi",
@@ -600,3 +638,53 @@ def test_generate_rejects_malformed_multimodal_tensor_specs() -> None:
         assert resp.status_code == 422, spec
 
     assert client.requests == []
+
+
+def test_generate_audio_controls_reach_backend_and_response() -> None:
+    class AudioControlClient(_RolloutClient):
+        async def completion(self, request, *, request_id, audio_format="wav"):
+            self.audio_format = audio_format
+            return await super().completion(
+                request, request_id=request_id, audio_format=audio_format
+            )
+
+    result = _text_result()
+    result.audio = CompletionAudio(id="audio", data="encoded", sample_rate=48000)
+    client = AudioControlClient(result)
+    http = TestClient(create_app(client, model_name="moss-tts-prism"))
+    for return_audio in (False, True):
+        response = http.post(
+            "/generate",
+            json={
+                "prompt": {"script": "Hello."},
+                "return_audio": return_audio,
+                "response_format": "flac",
+            },
+        )
+        assert response.status_code == 200
+        assert client.requests[-1].extra_params["return_audio"] is return_audio
+        assert client.audio_format == "flac"
+        if return_audio:
+            assert response.json()["audio"]["format"] == "flac"
+        else:
+            assert response.json()["audio"] is None
+    for invalid in ({"return_audio": "false"}, {"response_format": "mp3"}):
+        assert (
+            http.post("/generate", json={"prompt": "Hello", **invalid}).status_code
+            == 422
+        )
+
+
+def test_generate_classifies_prism_request_errors() -> None:
+    class InvalidPrismClient(_RolloutClient):
+        async def completion(self, request, *, request_id, audio_format="wav"):
+            raise RuntimeError(
+                "Prism RL request requires a finite positive audio temperature"
+            )
+
+    http = TestClient(
+        create_app(InvalidPrismClient(_text_result()), model_name="moss-tts-prism")
+    )
+    response = http.post("/generate", json={"prompt": {"script": "Hello."}})
+    assert response.status_code == 400
+    assert "positive audio temperature" in response.json()["detail"]

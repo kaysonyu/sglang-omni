@@ -68,6 +68,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.serve.action_scoring import register_action_scoring
 from sglang_omni.serve.generation_params import (
     record_explicit_generation_params as _record_explicit_generation_params,
 )
@@ -300,6 +301,7 @@ def create_app(
     register_chat_completions(app)
     register_voices(app)
     register_generate(app)
+    register_action_scoring(app, app.state.architectures)
     register_speech(app)
     register_speech_batch(app)
     register_speech_ws(app)
@@ -1045,7 +1047,7 @@ def register_generate(app: FastAPI) -> None:
             )
 
         request_id = str(uuid.uuid4())
-        audio_format = "wav"
+        audio_format = req.response_format
 
         try:
             gen_req = build_rollout_generate_request(req)
@@ -1101,19 +1103,34 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
     if req.messages is not None:
         messages = [Message(role=m.role, content=m.content) for m in req.messages]
 
+    stage_params = {
+        name: dict(parameters) for name, parameters in (req.stage_params or {}).items()
+    }
     stage_sampling: dict[str, SamplingParams] | None = None
     if req.stage_sampling:
         stage_sampling = {
             name: rollout_sampling_to_client(params)
             for name, params in req.stage_sampling.items()
         }
+        for name, parameters in req.stage_sampling.items():
+            if parameters.stop_sampling is not None:
+                stage_params.setdefault(name, {}).setdefault(
+                    "stop_sampling", parameters.stop_sampling
+                )
 
     extra_params: dict[str, Any] = {
         "return_logprob": req.return_logprob,
         "return_omni_rollout": req.return_omni_rollout,
+        **(
+            {"return_audio": req.return_audio}
+            if "return_audio" in req.model_fields_set
+            else {}
+        ),
         "return_routed_experts": req.return_routed_experts,
         "return_indexer_topk": req.return_indexer_topk,
     }
+    if req.sampling_params.stop_sampling is not None:
+        extra_params["stop_sampling"] = req.sampling_params.stop_sampling
     metadata = dict(req.metadata) if req.metadata else {}
     _record_explicit_generation_params(
         metadata,
@@ -1127,7 +1144,7 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
         messages=messages,
         sampling=sampling,
         stage_sampling=stage_sampling,
-        stage_params=req.stage_params,
+        stage_params=stage_params or None,
         extra_params=extra_params,
         stream=req.stream,
         max_tokens=sampling.max_new_tokens,
@@ -1193,8 +1210,12 @@ def build_generate_response(
             ),
         )
     audio: GenerateAudio | None = None
-    if result.audio is not None:
-        audio = GenerateAudio(data=result.audio.data, format=audio_format)
+    if req.return_audio and result.audio is not None:
+        audio = GenerateAudio(
+            data=result.audio.data,
+            format=audio_format,
+            sample_rate=result.audio.sample_rate,
+        )
 
     meta_info = GenerateMetaInfo(
         finish_reason=finish_reason,
