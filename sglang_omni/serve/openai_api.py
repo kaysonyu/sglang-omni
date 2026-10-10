@@ -1103,12 +1103,20 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
     if req.messages is not None:
         messages = [Message(role=m.role, content=m.content) for m in req.messages]
 
+    stage_params = {
+        name: dict(parameters) for name, parameters in (req.stage_params or {}).items()
+    }
     stage_sampling: dict[str, SamplingParams] | None = None
     if req.stage_sampling:
         stage_sampling = {
             name: rollout_sampling_to_client(params)
             for name, params in req.stage_sampling.items()
         }
+        for name, parameters in req.stage_sampling.items():
+            if parameters.stop_sampling is not None:
+                stage_params.setdefault(name, {}).setdefault(
+                    "stop_sampling", parameters.stop_sampling
+                )
 
     extra_params: dict[str, Any] = {
         "return_logprob": req.return_logprob,
@@ -1121,6 +1129,8 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
         "return_routed_experts": req.return_routed_experts,
         "return_indexer_topk": req.return_indexer_topk,
     }
+    if req.sampling_params.stop_sampling is not None:
+        extra_params["stop_sampling"] = req.sampling_params.stop_sampling
     metadata = dict(req.metadata) if req.metadata else {}
     _record_explicit_generation_params(
         metadata,
@@ -1134,7 +1144,7 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
         messages=messages,
         sampling=sampling,
         stage_sampling=stage_sampling,
-        stage_params=req.stage_params,
+        stage_params=stage_params or None,
         extra_params=extra_params,
         stream=req.stream,
         max_tokens=sampling.max_new_tokens,

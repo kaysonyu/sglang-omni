@@ -8,10 +8,14 @@ import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sglang.srt import runtime_context
 
+from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.models.moss_tts_local.config import MossTTSLocalScorePipelineConfig
+from sglang_omni.models.moss_tts_local.engine_builder import MossTtsLocalEngineBuilder
 from sglang_omni.models.moss_tts_local.local_transformer import MossTTSLocalTransformer
 from sglang_omni.models.moss_tts_local.scoring import (
+    LocalScoreEngineBuilder,
     build_score_request,
     score_local_depth,
 )
@@ -246,3 +250,62 @@ def test_teacher_prefill_aligns_mixed_request_boundaries(monkeypatch):
     assert requests[0].data.score_result["code_logprobs"] == [[-1.0, -1.0, -1.0]]
     assert requests[1].data.score_result["decision_logprobs"] == [-5.0]
     assert requests[1].data.score_result["code_logprobs"] == []
+
+
+def test_teacher_score_identity_matches_admin_checksum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Module()
+    model.projection = torch.nn.Linear(2, 2, bias=False)
+    model._decode_input_embedding = torch.nn.Embedding(2, 2)
+    model.register_buffer("runtime_cache", torch.zeros(2))
+    model_worker = object.__new__(ModelWorker)
+    model_worker.model_runner = SimpleNamespace(model=model)
+
+    def setup_model(
+        builder: MossTtsLocalEngineBuilder,
+        *,
+        model_worker: ModelWorker,
+        checkpoint_dir: str,
+        device: str,
+        gpu_id: int,
+        server_args: SimpleNamespace,
+    ) -> None:
+        """Supply CPU weights through the model-loading interface."""
+        builder.model = model_worker.model_runner.model
+
+    monkeypatch.setattr(MossTtsLocalEngineBuilder, "setup_model", setup_model)
+    monkeypatch.setattr(
+        runtime_context,
+        "get_serving",
+        lambda: SimpleNamespace(weight_version="teacher-v1"),
+    )
+    builder = LocalScoreEngineBuilder(
+        score_chunk_size=2,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+        total_gpu_memory_fraction=None,
+        codec_mem_reserve=0.0,
+    )
+    builder.setup_model(
+        model_worker=model_worker,
+        checkpoint_dir="unused",
+        device="cpu",
+        gpu_id=0,
+        server_args=SimpleNamespace(
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            quantization=None,
+        ),
+    )
+    builder.post_scheduler_setup(None, None)
+    identity = model.teacher_weight_sha256
+    assert model_worker.weights_checker("checksum")["per_gpu_checksum"] == identity
+    with torch.no_grad():
+        model._decode_input_embedding.weight.add_(1)
+        model.runtime_cache.add_(1)
+    assert model_worker.weights_checker("checksum")["per_gpu_checksum"] == identity
+    with torch.no_grad():
+        model.projection.weight.add_(1)
+    assert model_worker.weights_checker("checksum")["per_gpu_checksum"] != identity

@@ -1,12 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MOSS-TTS Local (v1.5) pipeline state."""
+"""MOSS-TTS Local prompt contracts and pipeline state."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
 from sglang_omni.scheduling.pipeline_state import DeclarativeStateBase, wire
+
+
+class MossTTSLocalScriptSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: str = Field(min_length=1)
+    local_instruction: str | None = None
+
+
+class MossTTSLocalReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+
+
+class MossTTSLocalPrompt(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    script: str | list[MossTTSLocalScriptSegment] = Field(min_length=1)
+    global_instruction: str | dict[str, JsonValue] | None = None
+    language: str | None = None
+    references: list[MossTTSLocalReference] = Field(default_factory=list)
 
 
 def moss_tts_local_special_token_defaults(
@@ -38,6 +63,9 @@ class MossTTSLocalState(DeclarativeStateBase):
 
     sample_rate: int = wire(48000, codec="int_or")
     text: str = wire("", codec="str")
+    script: str | list[dict[str, str]] | None = None
+    global_instruction: str | None = None
+    references: list[dict[str, str]] = wire(default_factory=list, emit="truthy")
     ref_audio: Any | None = None
     ref_text: str | None = None
     language: str | None = None

@@ -9,6 +9,8 @@ branchless frame decoder eagerly. No teacher scoring endpoint is added.
 
 RL rollout is used with non-streaming requests (`stream=false`).
 It accepts a text prompt or a dictionary containing text and references.
+V2 checkpoints also accept the [structured Local prompt contract](../cookbook/moss_tts_local.md#structured-prompts-with-a-v2-checkpoint);
+the checkpoint processor renders the prompt and determines its renderer revision.
 Send `/generate` requests with `return_logprob=true` and
 `return_omni_rollout=true`. Supply positive text/audio temperatures,
 `top_p=1`, `top_k=-1`, and `repetition_penalty=1`. The first version supports
