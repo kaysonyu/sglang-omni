@@ -22,6 +22,11 @@ with CPU backups. The launcher installs the memory saver's subprocess allocator
 hook before starting these workers. Memory offload cannot be combined with
 `weight_share: on`.
 
+Engine weights follow SGLang's default discard-and-republish behavior. Restore
+weights with a complete update before resuming generation, or set the engine's
+`enable_weights_cpu_backup: true` when its weights must survive offload without
+publication, as for a frozen teacher.
+
 `POST /release_memory_occupation` and `POST /resume_memory_occupation` accept
 `tags: [weights, kv_cache, cuda_graph]` and optional `stages`. Omitting tags selects
 all tags; omitting stages targets the pipeline. Memory release requires an idle
