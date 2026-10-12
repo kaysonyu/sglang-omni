@@ -126,6 +126,7 @@ def test_omni_scheduler_update_weights_rejects_active_requests_by_default() -> N
         or (True, "ok")
     )
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
@@ -154,6 +155,7 @@ def test_omni_scheduler_weights_checker_compare_change_is_success() -> None:
 
     scheduler = object.__new__(OmniScheduler)
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler.model_worker = SimpleNamespace(
         weights_checker=lambda action: {
             "action": action,
@@ -209,6 +211,7 @@ def test_omni_scheduler_weight_updates_flush_and_advance_epoch(
     scheduler = object.__new__(OmniScheduler)
     scheduler.model_worker = SimpleNamespace(**{worker_method: update_weights})
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
@@ -244,6 +247,7 @@ def test_weight_swap_isolates_prompt_cache_when_flush_fails() -> None:
         update_weights_from_disk=lambda _: (True, "swapped")
     )
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._request_admission_lock = threading.RLock()
     scheduler._engine_paused = True
     scheduler._last_pause_mode = "retract"
@@ -283,6 +287,7 @@ def test_tensor_update_failure_keeps_engine_paused(failure_mode: str) -> None:
         update_weights_from_tensor=update_weights_from_tensor
     )
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._prompt_cache_epoch = 0
@@ -370,6 +375,7 @@ def test_omni_scheduler_distributed_update_rejects_active_requests_by_default() 
         or (True, "ok")
     )
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
@@ -426,6 +432,7 @@ def test_omni_scheduler_distributed_update_aborts_and_flushes_cache() -> None:
         update_weights_from_distributed=update_weights_from_distributed
     )
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
@@ -475,6 +482,7 @@ def test_omni_scheduler_distributed_update_failure_keeps_engine_paused() -> None
         update_weights_from_distributed=update_weights_from_distributed
     )
     scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
@@ -567,3 +575,59 @@ def test_stage_admin_dispatches_to_scheduler() -> None:
         assert result_msg.result.data["action"] == "pause_generation"
 
     asyncio.run(_run())
+
+
+def test_memory_offload_keeps_engine_paused_until_all_tags_resume():
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
+    scheduler._engine_paused = False
+    scheduler._last_pause_mode = None
+    scheduler.continue_after_memory_resume = False
+    scheduler.offload_tags = set()
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: []
+    scheduler.empty_torch_cache = lambda: None
+    calls = []
+
+    def release(request):
+        calls.append(("release", request.tags))
+        scheduler.offload_tags.update(request.tags)
+
+    def resume(request):
+        calls.append(("resume", request.tags))
+        scheduler.offload_tags.difference_update(request.tags)
+
+    scheduler.memory_occupation = SimpleNamespace(
+        memory_saver_adapter=SimpleNamespace(enabled=True),
+        release_memory_occupation=release,
+        resume_memory_occupation=resume,
+    )
+    released = scheduler.admin_memory_occupation("release_memory_occupation", {})
+    assert released["data"]["engine_paused"]
+    scheduler.admin_memory_occupation("resume_memory_occupation", {"tags": ["weights"]})
+    assert scheduler.admin_continue_generation({})["data"]["engine_paused"]
+    resumed = scheduler.admin_memory_occupation(
+        "resume_memory_occupation", {"tags": ["kv_cache", "cuda_graph"]}
+    )
+    assert resumed["data"]["offload_tags"] == []
+    assert not resumed["data"]["engine_paused"]
+    scheduler.admin_memory_occupation("resume_memory_occupation", {})
+    assert len(calls) == 3
+
+
+def test_memory_release_refuses_active_engine():
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = set()
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: ["running"]
+    scheduler.memory_occupation = SimpleNamespace(
+        memory_saver_adapter=SimpleNamespace(enabled=True)
+    )
+    with pytest.raises(ValueError, match="idle"):
+        scheduler.admin_memory_occupation("release_memory_occupation", {})

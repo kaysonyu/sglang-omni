@@ -630,13 +630,18 @@ class UpdateWeightFromDiskRequest(AdminRequestBase):
 
 
 class UpdateWeightsFromTensorRequest(AdminRequestBase):
-    serialized_named_tensors: list[Any] | None = None
+    serialized_named_tensors: list[str] = Field(min_length=1)
     load_format: str | None = None
     flush_cache: bool = True
     abort_all_requests: bool = False
     weight_version: str | None = None
     disable_draft_model: bool | None = None
     torch_empty_cache: bool = False
+    keep_pause: bool = False
+
+
+class MemoryOccupationRequest(AdminRequestBase):
+    tags: list[Literal["weights", "kv_cache", "cuda_graph"]] | None = None
 
 
 class UpdateWeightsFromDistributedRequest(AdminRequestBase):

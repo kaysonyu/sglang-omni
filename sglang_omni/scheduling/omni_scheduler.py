@@ -28,7 +28,11 @@ from typing import Any, Callable
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -56,6 +60,8 @@ from sglang_omni.proto.admin import (
     ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
     ADMIN_MODEL_INFO,
     ADMIN_PAUSE_GENERATION,
+    ADMIN_RELEASE_MEMORY,
+    ADMIN_RESUME_MEMORY,
     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
     ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED,
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
@@ -482,6 +488,7 @@ class OmniScheduler:
         self.is_hybrid_swa = False
         self.is_hybrid_ssm = False
         self.offload_tags: set = set()
+        self.continue_after_memory_resume = False
         self.is_initializing = False
         self.truncation_align_size = None
 
@@ -624,7 +631,20 @@ class OmniScheduler:
         from sglang.srt.managers.scheduler_components.pool_stats_observer import (
             SchedulerPoolStatsObserver,
         )
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            SchedulerWeightUpdaterManager,
+        )
         from sglang.srt.runtime_context import get_parallel
+
+        self.memory_occupation = SchedulerWeightUpdaterManager(
+            tp_worker=self.model_worker,
+            draft_worker=None,
+            tp_cpu_group=self.tp_cpu_group,
+            memory_saver_adapter=self.model_worker.model_runner.memory_saver_adapter,
+            flush_cache=self.flush_cache_after_update,
+            is_fully_idle=lambda: not self.active_request_ids(),
+            offload_tags=self.offload_tags,
+        )
 
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             model_runner=self.tp_worker.model_runner,
@@ -1965,6 +1985,8 @@ class OmniScheduler:
             return self.admin_pause_generation(payload)
         if action == ADMIN_CONTINUE_GENERATION:
             return self.admin_continue_generation(payload)
+        if action in {ADMIN_RELEASE_MEMORY, ADMIN_RESUME_MEMORY}:
+            return self.admin_memory_occupation(action, payload)
         if action == ADMIN_UPDATE_WEIGHTS_FROM_DISK:
             return self.admin_update_weights_from_disk(payload)
         if action == ADMIN_UPDATE_WEIGHTS_FROM_TENSOR:
@@ -1995,6 +2017,7 @@ class OmniScheduler:
                 "stage_tp_rank": self.tp_rank,
                 "stage_tp_size": self.tp_size,
                 "engine_paused": self._engine_paused,
+                "offload_tags": sorted(self.offload_tags),
                 "waiting_queue_size": waiting_queue_size,
                 "request_build_workers": self.request_build_max_workers,
                 "request_build_pending": request_build_pending,
@@ -2023,6 +2046,7 @@ class OmniScheduler:
 
         with self._admin_lock:
             self._engine_paused = True
+            self.continue_after_memory_resume = False
             self._last_pause_mode = mode
             self.resolve_pending_async()
             num_paused = 0
@@ -2044,12 +2068,55 @@ class OmniScheduler:
         with self._admin_lock:
             if bool(payload.get("torch_empty_cache", True)):
                 self.empty_torch_cache()
-            self._engine_paused = False
+            self.continue_after_memory_resume = bool(self.offload_tags)
+            self._engine_paused = bool(self.offload_tags)
             self._last_pause_mode = None
         return {
             "success": True,
             "message": "generation continued",
             "data": {"engine_paused": self._engine_paused},
+        }
+
+    def admin_memory_occupation(
+        self, action: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+
+        requested = payload.get("tags") or GPU_MEMORY_ALL_TYPES
+        if not isinstance(requested, list) or any(
+            tag not in GPU_MEMORY_ALL_TYPES for tag in requested
+        ):
+            raise ValueError("Memory tags must be weights, kv_cache, or cuda_graph")
+        if not self.memory_occupation.memory_saver_adapter.enabled:
+            raise ValueError("Memory release requires enable_memory_saver=true")
+        with self._admin_lock:
+            self.resolve_pending_async()
+            if action == ADMIN_RELEASE_MEMORY:
+                if self.active_request_ids():
+                    raise ValueError("Memory release requires an idle engine")
+                self._engine_paused = True
+                tags = [tag for tag in requested if tag not in self.offload_tags]
+                if tags:
+                    self.memory_occupation.release_memory_occupation(
+                        ReleaseMemoryOccupationReqInput(tags=tags)
+                    )
+            else:
+                tags = [tag for tag in requested if tag in self.offload_tags]
+                if tags:
+                    self.memory_occupation.resume_memory_occupation(
+                        ResumeMemoryOccupationReqInput(tags=tags)
+                    )
+                if not self.offload_tags and self.continue_after_memory_resume:
+                    self._engine_paused = False
+                    self.continue_after_memory_resume = False
+            self.empty_torch_cache()
+        return {
+            "success": True,
+            "message": "memory occupation updated",
+            "data": {
+                "offload_tags": sorted(self.offload_tags),
+                "engine_paused": self._engine_paused,
+            },
         }
 
     def admin_update_weights_from_disk(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2074,6 +2141,8 @@ class OmniScheduler:
         keep_pause = bool(payload.get("keep_pause", False))
         keep_engine_paused = keep_pause
         with self._admin_lock:
+            if "weights" in self.offload_tags:
+                raise RuntimeError("Resume weights before updating them")
             previous_pause_state = self._engine_paused
             self._engine_paused = True
             try:

@@ -26,6 +26,7 @@ from sglang_omni.comm.data_ref import DataKind, DataRef
 from sglang_omni.comm.engine import CommEngine, KVTransferCancelled, KVTransferRejected
 from sglang_omni.comm.kv_transfer import KVPageTransfer
 from sglang_omni.comm.router import CommRouter
+from sglang_omni.pipeline.memory_saver import StageMemorySaver
 from sglang_omni.pipeline.replicas import ReplicaTopology
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
@@ -102,6 +103,7 @@ class Stage:
         relay: Relay | None = None,
         comm_config: dict[str, Any] | None = None,
         scheduler: Any = None,
+        memory_saver: StageMemorySaver | None = None,
         project_payload: dict[str, Callable[[Any], Any]] | None = None,
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
@@ -124,6 +126,7 @@ class Stage:
         self.control_plane = control_plane
         self.input_handler = input_handler or DirectInput()
         self.scheduler = scheduler
+        self.memory_saver = memory_saver
         self._project_payload = project_payload or {}
         self._stream_targets = stream_targets or []
         self.get_stream_done_targets = get_stream_done_targets
@@ -1020,6 +1023,16 @@ class Stage:
 
     async def run_admin_operation(self, operation: Any) -> AdminResult:
         try:
+            if self.memory_saver is not None and operation.action in {
+                "release_memory_occupation",
+                "resume_memory_occupation",
+            }:
+                outcome = await asyncio.to_thread(
+                    self.memory_saver.change_occupation,
+                    operation.action,
+                    operation.payload.get("tags"),
+                )
+                return self.admin_result_from_outcome(operation, outcome)
             handler = getattr(self.scheduler, "admin", None)
             if handler is None:
                 return self.admin_result(

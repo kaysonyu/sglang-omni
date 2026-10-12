@@ -645,11 +645,18 @@ class PipelineConfig(BaseModel):
     env_defaults: dict[str, str] = Field(default_factory=dict)
     mps: Literal["off", "on", "auto"] = "off"
     weight_share: Literal["off", "on"] = "off"
+    enable_memory_saver: bool = False
     placement: PlacementConfig = Field(default_factory=PlacementConfig)
     placement_policy: str | None = None
     endpoints: EndpointsConfig = Field(default_factory=EndpointsConfig)
     terminal_stages_fn: str | None = None
     config_cls: str | None = None
+
+    @model_validator(mode="after")
+    def validate_memory_saver(self) -> "PipelineConfig":
+        if self.enable_memory_saver and self.weight_share != "off":
+            raise ValueError("enable_memory_saver cannot be combined with weight_share")
+        return self
 
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         """Dump with each stage serialized by its runtime class.
