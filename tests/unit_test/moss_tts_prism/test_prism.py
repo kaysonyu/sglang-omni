@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prism schedule, carrier, loader and streaming contracts."""
 
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from torch import nn
 
+from sglang_omni.client.client import Client
 from sglang_omni.models.moss_tts_prism.config import MossTTSPrismPipelineConfig
 from sglang_omni.models.moss_tts_prism.engine_builder import MossTTSPrismEngineBuilder
 from sglang_omni.models.moss_tts_prism.model_runner import (
@@ -15,6 +18,7 @@ from sglang_omni.models.moss_tts_prism.model_runner import (
     prism_request_inputs,
 )
 from sglang_omni.models.moss_tts_prism.request_builders import (
+    PrismPrompt,
     PrismRequestData,
     PrismStreamOutputBuilder,
     build_prism_prompt,
@@ -28,6 +32,9 @@ from sglang_omni.models.moss_tts_prism.sglang_model import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput, SchedulerRequest
+from sglang_omni.serve.openai_api import build_rollout_generate_request
+from sglang_omni.serve.protocol import RolloutGenerateRequest
+from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
 def unit(kind, index, start, stop, heads=()):
@@ -329,11 +336,17 @@ def test_preprocess_uses_prism_prompt_fields():
         def _replace_placeholders(self, content, references, *, role):
             return content
 
+    inputs = {
+        "script": "hello",
+        "task_type": "Instruction",
+        "show_language": False,
+        "global_instruction": '{"Speed":"slow"}',
+    }
     payload = StagePayload(
         request_id="test",
         request=OmniRequest(
-            inputs="hello",
-            params={"instructions": "Speak softly", "max_new_tokens": 12, "seed": 42},
+            inputs=inputs,
+            params={"max_new_tokens": 12, "seed": 42},
         ),
         data={},
     )
@@ -343,8 +356,10 @@ def test_preprocess_uses_prism_prompt_fields():
     assert observed == {
         "script": "hello",
         "reference": None,
-        "global_instruction": "Speak softly",
+        "global_instruction": '{"Speed":"slow"}',
         "tokens": None,
+        "task_type": "Instruction",
+        "language": None,
     }
     assert prepared.data["prism_inputs"]["input_ids"].tolist() == [
         [3, 0, 0],
@@ -352,6 +367,434 @@ def test_preprocess_uses_prism_prompt_fields():
         [5, 0, 0],
     ]
     assert prepared.data["generation_kwargs"]["seed"] == 42
+    sampled_payload = StagePayload(
+        request_id="sampled",
+        request=OmniRequest(
+            inputs=inputs,
+            params={
+                "stop_sampling": True,
+                "return_omni_rollout": True,
+                "return_logprob": True,
+            },
+        ),
+        data={},
+    )
+    sampled = preprocess_prism_payload(
+        sampled_payload, processor=Processor(), reference_encoder=None
+    )
+    assert sampled.data["generation_kwargs"]["stop_sampling"] is True
+    inference = preprocess_prism_payload(
+        StagePayload(
+            request_id="inference",
+            request=OmniRequest(inputs=inputs, params={"stop_sampling": True}),
+            data={},
+        ),
+        processor=Processor(),
+        reference_encoder=None,
+    )
+    assert inference.data["generation_kwargs"]["stop_sampling"] is True
+    assert inference.data.get("return_omni_rollout", False) is False
+
+
+@pytest.fixture
+def speech_processor() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            n_vq=2, audio_start_token_id=5, audio_user_slot_token_id=6, text_pad_idx=0
+        ),
+        chat_template="template",
+        tokenizer=SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: messages[0]["content"],
+            encode=lambda content, **kwargs: [3, 7],
+        ),
+        build_user_message=Mock(
+            return_value={"content": "hello", "audio_codes_list": []}
+        ),
+        _normalize_user=lambda message: message,
+        _replace_placeholders=lambda content, references, **kwargs: content,
+    )
+
+
+@pytest.mark.parametrize("top_level_mode", [None, False, True])
+@pytest.mark.parametrize("stage_sampling_mode", [None, False, True])
+@pytest.mark.parametrize("stage_params_mode", [None, False, True])
+def test_rollout_stop_sampling_respects_stage_precedence(
+    speech_processor: SimpleNamespace,
+    top_level_mode: bool | None,
+    stage_sampling_mode: bool | None,
+    stage_params_mode: bool | None,
+) -> None:
+    rollout_request = RolloutGenerateRequest(
+        prompt={"script": "hello", "task_type": "TTS", "show_language": False},
+        sampling_params={"stop_sampling": top_level_mode},
+        stage_sampling={"tts_engine": {"stop_sampling": stage_sampling_mode}},
+        stage_params=(
+            {"tts_engine": {"stop_sampling": stage_params_mode}}
+            if stage_params_mode is not None
+            else None
+        ),
+    )
+    request = Client.build_omni_request(build_rollout_generate_request(rollout_request))
+    prepared = preprocess_prism_payload(
+        StagePayload(request_id="stop-precedence", request=request, data={}),
+        processor=speech_processor,
+        reference_encoder=None,
+    )
+    if stage_params_mode is not None:
+        expected = stage_params_mode
+    elif stage_sampling_mode is not None:
+        expected = stage_sampling_mode
+    elif top_level_mode is not None:
+        expected = top_level_mode
+    else:
+        expected = False
+    assert prepared.data["generation_kwargs"]["stop_sampling"] is expected
+
+
+@pytest.mark.parametrize("invalid_mode", ["true", 1, None])
+def test_preprocess_rejects_non_boolean_stage_stop_sampling(
+    speech_processor: SimpleNamespace, invalid_mode: str | int | None
+) -> None:
+    request = OmniRequest(
+        inputs="hello",
+        params={
+            "stop_sampling": True,
+            "stage_params": {"tts_engine": {"stop_sampling": invalid_mode}},
+        },
+    )
+    with pytest.raises(ValueError, match="stop_sampling must be a boolean"):
+        preprocess_prism_payload(
+            StagePayload(request_id="invalid-stop-mode", request=request, data={}),
+            processor=speech_processor,
+            reference_encoder=None,
+        )
+    speech_processor.build_user_message.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("stop_sampling", [False, True])
+def test_speech_stop_sampling_uses_stage_params(
+    speech_processor: SimpleNamespace, stream: bool, stop_sampling: bool
+) -> None:
+    service = SpeechRequestValidator(default_model="prism")
+    speech = service.parse_generation_request(
+        {
+            "input": "hello",
+            "stream": stream,
+            "response_format": "pcm" if stream else "wav",
+            "stage_params": {"tts_engine": {"stop_sampling": stop_sampling}},
+        }
+    )
+    request = Client.build_omni_request(
+        service.build_generate_request(
+            speech.request,
+            validate=False,
+            reference_descriptors=speech.reference_descriptors,
+        )
+    )
+    prepared = preprocess_prism_payload(
+        StagePayload(request_id="speech-stop-mode", request=request, data={}),
+        processor=speech_processor,
+        reference_encoder=None,
+    )
+    assert prepared.data["generation_kwargs"]["stop_sampling"] is stop_sampling
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "fields, expected_task, expected_language, expected_tokens",
+    [
+        ({}, "TTS", None, None),
+        ({"language": "Auto"}, "TTS", None, None),
+        (
+            {
+                "instructions": '{"Speed":"slow"}',
+                "language": "Chinese",
+                "duration_tokens": 120,
+            },
+            "Instruction",
+            "Chinese",
+            120,
+        ),
+        (
+            {"task_type": "VoiceDesign", "instructions": '{"Emotion":"happy"}'},
+            "Instruction",
+            None,
+            None,
+        ),
+        (
+            {"task_type": "Base", "ref_audio": "data:audio/wav;base64,UklGRg=="},
+            "Full VoiceClone",
+            None,
+            None,
+        ),
+        (
+            {
+                "ref_audio": "data:audio/wav;base64,UklGRg==",
+                "instructions": '{"Speed":"slow"}',
+            },
+            "Instruction Voice Clone",
+            None,
+            None,
+        ),
+    ],
+)
+def test_preprocess_accepts_speech_api_requests(
+    speech_processor: SimpleNamespace,
+    stream: bool,
+    fields: dict[str, str | int],
+    expected_task: str,
+    expected_language: str | None,
+    expected_tokens: int | None,
+) -> None:
+    service = SpeechRequestValidator(default_model="prism")
+    prepared = service.parse_generation_request(
+        {
+            "input": "hello",
+            "stream": stream,
+            "response_format": "pcm" if stream else "wav",
+            **fields,
+        }
+    )
+    request = Client.build_omni_request(
+        service.build_generate_request(
+            prepared.request,
+            validate=False,
+            reference_descriptors=prepared.reference_descriptors,
+        )
+    )
+    codes = torch.tensor([[1, 2], [3, 4]])
+    reference_encoder = SimpleNamespace(encode_data_uri=Mock(return_value=codes))
+    result = preprocess_prism_payload(
+        StagePayload(request_id="speech", request=request, data={}),
+        processor=speech_processor,
+        reference_encoder=reference_encoder,
+    )
+    arguments = speech_processor.build_user_message.call_args.kwargs
+    assert arguments["script"] == "hello"
+    assert arguments["task_type"] == expected_task
+    assert arguments["global_instruction"] == fields.get("instructions")
+    assert arguments["language"] == expected_language
+    assert arguments["tokens"] == expected_tokens
+    assert result.request.params["stream"] is stream
+    if "ref_audio" in fields:
+        reference_encoder.encode_data_uri.assert_called_once_with(fields["ref_audio"])
+        torch.testing.assert_close(arguments["reference"][0], codes)
+    else:
+        assert arguments["reference"] is None
+        reference_encoder.encode_data_uri.assert_not_called()
+
+
+@pytest.mark.parametrize("input_kind", ["string", "text", "input"])
+def test_preprocess_accepts_generic_text_and_local_reference(
+    speech_processor: SimpleNamespace, input_kind: str, tmp_path: Path
+) -> None:
+    reference_path = str(tmp_path / "reference.wav")
+    text = "${token:120} hello"
+    if input_kind == "string":
+        inputs = text
+        metadata = {"tts_params": {"ref_audio": reference_path}}
+    else:
+        inputs = {input_kind: text, "references": [{"audio_path": reference_path}]}
+        metadata = {}
+    codes = torch.tensor([[1, 2]])
+    reference_encoder = SimpleNamespace(encode=Mock(return_value=codes))
+    preprocess_prism_payload(
+        StagePayload(
+            request_id="generic",
+            request=OmniRequest(
+                inputs=inputs,
+                params={"task_type": "Base VoiceClone", "language": "English"},
+                metadata=metadata,
+            ),
+            data={},
+        ),
+        processor=speech_processor,
+        reference_encoder=reference_encoder,
+    )
+    arguments = speech_processor.build_user_message.call_args.kwargs
+    assert arguments["script"] == "hello"
+    assert arguments["task_type"] == "Base VoiceClone"
+    assert arguments["language"] == "English"
+    assert arguments["tokens"] == 120
+    torch.testing.assert_close(arguments["reference"][0], codes)
+    reference_encoder.encode.assert_called_once_with(reference_path)
+
+
+@pytest.mark.parametrize(
+    "inputs, params, message",
+    [
+        (" ", {}, "blank"),
+        ({"script": "hello"}, {}, "task_type"),
+        ({"script": "hello", "text": "fallback"}, {}, "task_type"),
+        (
+            {"script": "hello", "task_type": "TTS", "show_language": False},
+            {"language": "English"},
+            "language belongs in the structured prompt",
+        ),
+        (
+            {"script": "hello", "task_type": "TTS", "show_language": False},
+            {"token_count": 120},
+            "global_tokens belongs in the structured prompt",
+        ),
+        (
+            {
+                "text": "hello",
+                "references": [
+                    {"audio_path": "first.wav"},
+                    {"audio_path": "second.wav"},
+                ],
+            },
+            {},
+            "multiple references require a structured prompt",
+        ),
+    ],
+)
+def test_generic_fallback_preserves_prompt_validation(
+    inputs: str | dict[str, str | bool | list[dict[str, str]]],
+    params: dict[str, str | int],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        preprocess_prism_payload(
+            StagePayload(
+                request_id="invalid",
+                request=OmniRequest(inputs=inputs, params=params),
+                data={},
+            ),
+            processor=None,
+            reference_encoder=None,
+        )
+
+
+@pytest.mark.parametrize("revision", [4, 6, 7, 42])
+def test_preprocess_fixed_contract_forwards_task_and_displayed_language(revision):
+    observed = {}
+
+    class Processor:
+        model_config = SimpleNamespace(
+            n_vq=2,
+            audio_start_token_id=5,
+            audio_user_slot_token_id=6,
+            text_pad_idx=0,
+            prompt_renderer_revision=revision,
+        )
+        chat_template = "template"
+        tokenizer = SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: messages[0]["content"],
+            encode=lambda content, **kwargs: [3, 7],
+        )
+
+        def build_user_message(self, **kwargs):
+            observed.update(kwargs)
+            return {"content": kwargs["script"], "audio_codes_list": []}
+
+        def _normalize_user(self, message):
+            return message
+
+        def _replace_placeholders(self, content, references, *, role):
+            return content
+
+    fields = {
+        "script": "你好。",
+        "task_type": "Instruction",
+        "show_language": True,
+        "language": "Chinese",
+        "global_instruction": '{"Speed":"slow"}',
+    }
+    payload = StagePayload(
+        request_id="v4", request=OmniRequest(inputs=fields, params={}), data={}
+    )
+    preprocess_prism_payload(payload, processor=Processor(), reference_encoder=None)
+    assert observed == {
+        "script": "你好。",
+        "reference": None,
+        "global_instruction": '{"Speed":"slow"}',
+        "tokens": None,
+        "task_type": "Instruction",
+        "language": "Chinese",
+    }
+    observed.clear()
+    preprocess_prism_payload(
+        StagePayload(
+            request_id="controlled",
+            request=OmniRequest(
+                inputs={**fields, "tokens_control": True, "global_tokens": 120}
+            ),
+            data={},
+        ),
+        processor=Processor(),
+        reference_encoder=None,
+    )
+    assert observed["tokens"] == 120
+    observed.clear()
+    preprocess_prism_payload(
+        StagePayload(
+            request_id="checkpoint-task",
+            request=OmniRequest(
+                inputs={
+                    **fields,
+                    "task_type": "Checkpoint-defined task",
+                    "show_language": False,
+                }
+            ),
+            data={},
+        ),
+        processor=Processor(),
+        reference_encoder=None,
+    )
+    assert observed["task_type"] == "Checkpoint-defined task"
+    assert observed["language"] is None
+    with pytest.raises(ValueError, match="global_tokens requires tokens_control"):
+        preprocess_prism_payload(
+            StagePayload(
+                request_id="invalid-tokens",
+                request=OmniRequest(inputs={**fields, "global_tokens": 120}),
+                data={},
+            ),
+            processor=Processor(),
+            reference_encoder=None,
+        )
+    with pytest.raises(ValueError, match="task_type"):
+        preprocess_prism_payload(
+            StagePayload(
+                request_id="missing",
+                request=OmniRequest(inputs={"script": "你好。", "show_language": True}),
+                data={},
+            ),
+            processor=Processor(),
+            reference_encoder=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"script": [{"text": "hello"}]}, "script"),
+        ({"script": " "}, "blank"),
+        ({"task_type": " "}, "blank"),
+        ({"show_language": "false"}, "show_language"),
+        ({"show_language": True}, "requires language"),
+        ({"tokens_control": "true"}, "tokens_control"),
+        ({"tokens_control": True}, "requires global_tokens"),
+        ({"global_tokens": 120}, "requires tokens_control"),
+        ({"tokens_control": True, "global_tokens": 0}, "global_tokens"),
+        ({"tokens_control": True, "global_tokens": True}, "global_tokens"),
+    ],
+)
+def test_fixed_prompt_rejects_inconsistent_controls(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        PrismPrompt.model_validate(
+            {"script": "hello", "task_type": "TTS", "show_language": False, **overrides}
+        )
+
+
+@pytest.mark.parametrize(
+    "inputs", ["hello", {"script": "hello"}, {"script": "hello", "task_type": "TTS"}]
+)
+def test_fixed_prompt_rejects_implicit_legacy_inputs(inputs):
+    with pytest.raises(ValueError, match="PrismPrompt"):
+        PrismPrompt.model_validate(inputs)
 
 
 def test_prompt_reference_frames_and_successor_edges():
@@ -693,6 +1136,7 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
                 processor,
                 processor.build_user_message(
                     script="The train crossed the river as the city came to life.",
+                    task_type="Full VoiceClone",
                     reference=[codes % config.speech_vocab_size],
                 ),
             )
