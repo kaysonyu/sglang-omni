@@ -1023,6 +1023,17 @@ class Stage:
 
     async def run_admin_operation(self, operation: Any) -> AdminResult:
         try:
+            memory_action = operation.action in {
+                "release_memory_occupation",
+                "resume_memory_occupation",
+            }
+            if memory_action and self.gpu_id is None:
+                return self.admin_result(
+                    operation,
+                    success=True,
+                    message="CPU stage has no GPU allocations",
+                    data={"offload_tags": []},
+                )
             if self.memory_saver is not None and operation.action in {
                 "release_memory_occupation",
                 "resume_memory_occupation",
@@ -1035,6 +1046,13 @@ class Stage:
                 return self.admin_result_from_outcome(operation, outcome)
             handler = getattr(self.scheduler, "admin", None)
             if handler is None:
+                if memory_action:
+                    return self.admin_result(
+                        operation,
+                        success=False,
+                        message="GPU stage requires enable_memory_saver=true",
+                        error="GPU memory offload is not enabled",
+                    )
                 return self.admin_result(
                     operation,
                     success=True,

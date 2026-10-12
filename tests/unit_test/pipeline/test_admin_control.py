@@ -686,3 +686,30 @@ def test_pipeline_admission_waits_for_complete_memory_resume() -> None:
         await coordinator.submit_request("new", "hello")
 
     asyncio.run(asyncio.wait_for(run(), timeout=3))
+
+
+@pytest.mark.parametrize(
+    "action", ["release_memory_occupation", "resume_memory_occupation"]
+)
+@pytest.mark.parametrize("gpu_id", [None, 0])
+def test_memory_control_distinguishes_cpu_stages_from_unconfigured_gpu_stages(
+    action: str, gpu_id: int | None
+) -> None:
+    stage = Stage(
+        name="preprocess",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=RecordingStageControlPlane(),
+        relay=FakeRelay(),
+        scheduler=FakeScheduler(),
+    )
+    stage.gpu_id = gpu_id
+    result = asyncio.run(
+        stage.run_admin_operation(AdminOperation(op_id="memory", action=action))
+    )
+    if gpu_id is None:
+        assert result.success and result.data["offload_tags"] == []
+    else:
+        assert not result.success and "not enabled" in result.error

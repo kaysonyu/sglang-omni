@@ -33,12 +33,14 @@ The worker server supports:
 - `POST /continue_generation`
 - `POST /update_weights_from_disk`
 - `POST /update_weights_from_tensor`
+- `POST /release_memory_occupation`
+- `POST /resume_memory_occupation`
 - `POST /init_weights_update_group`
 - `POST /destroy_weights_update_group`
 - `POST /update_weights_from_distributed`
 - `GET|POST /weights_checker`
 
-`/update_weights_from_disk` is the primary implemented update path. It pauses
+`/update_weights_from_disk` pauses
 the target scheduler, optionally aborts active requests, calls the underlying
 SGLang model runner update method, optionally flushes cache, and resumes unless
 `keep_pause=true`. From-disk updates run on the scheduler thread. If active
@@ -57,11 +59,18 @@ update fails, the scheduler remains paused because SGLang may have partially
 updated the model weights; recover by reloading or otherwise repairing the
 worker before calling `continue_generation`.
 
-`/update_weights_from_tensor` is still reserved for a future tensor data-plane
-integration and returns HTTP 501 from the worker and router HTTP APIs. Once
-enabled, a failed tensor update leaves the scheduler paused because tensor
-loading is non-transactional; repair the worker before calling
-`continue_generation`.
+`/update_weights_from_tensor` accepts one serialized CUDA IPC payload per TP rank
+at the worker. The actual tensor bytes stay on the local GPU; the control plane
+forwards handles and metadata. Each rank opens only its own handles and
+synchronizes the copy before acknowledging it. A failed tensor update leaves
+the scheduler paused because tensor loading is non-transactional. The Python
+router retains its HTTP 501 response for this route: colocated trainers address
+their corresponding worker directly rather than broadcasting local handles.
+
+The memory occupation endpoints release and restore weights, KV cache and CUDA
+graph allocations when `enable_memory_saver: true` is configured. See
+[Colocated RL](colocated_rl.md) for the per-stage behavior, supported graph
+configuration, and the pause/update/resume sequence.
 
 ## Stage and TP Behavior
 
