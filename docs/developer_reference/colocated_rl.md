@@ -39,7 +39,8 @@ A colocated iteration is:
 5. Commit the new weight version and restore KV and graph memory.
 6. Generate the next rollout.
 
-Prism's AR decode/prefill graphs retain their existing SGLang lifecycle. Its
-separate vocoder uses eager execution when memory saving is enabled; explicitly
+Prism keeps its AR decode graphs. SGLang's breakable prefill backend rejects
+memory saving, so select `--tts_engine.engine.cuda_graph_backend_prefill disabled`
+for eager prefill. Its separate vocoder uses eager execution when memory saving is enabled; explicitly
 enabling vocoder CUDA graphs with memory saving is rejected. Its reference encoder
 and vocoder weights are backed up to CPU during offload.

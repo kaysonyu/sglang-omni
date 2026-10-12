@@ -586,7 +586,6 @@ def test_memory_offload_keeps_engine_paused_until_all_tags_resume():
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler.continue_after_memory_resume = False
-    scheduler.offload_tags = set()
     scheduler.resolve_pending_async = lambda: None
     scheduler.active_request_ids = lambda: []
     scheduler.empty_torch_cache = lambda: None
@@ -631,3 +630,59 @@ def test_memory_release_refuses_active_engine():
     )
     with pytest.raises(ValueError, match="idle"):
         scheduler.admin_memory_occupation("release_memory_occupation", {})
+
+
+def test_tensor_update_refuses_released_weight_storage() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._admin_lock = threading.Lock()
+    scheduler.offload_tags = {"weights"}
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_tensor=lambda payload: pytest.fail(
+            "Released storage must not be accessed"
+        )
+    )
+    with pytest.raises(RuntimeError, match="Resume weights"):
+        scheduler.admin_update_weights_from_tensor(
+            {"serialized_named_tensors": ["handle"]}
+        )
+
+
+def test_pipeline_admission_waits_for_complete_memory_resume() -> None:
+    async def run() -> None:
+        coordinator = Coordinator(
+            "inproc://complete", "inproc://abort", entry_stage="decode"
+        )
+        control_plane = RecordingCoordinatorControlPlane()
+        coordinator.control_plane = control_plane
+        coordinator._running = True
+        coordinator.register_stage("decode", "inproc://decode")
+        for action, remaining in (
+            ("release_memory_occupation", ["weights", "kv_cache", "cuda_graph"]),
+            ("resume_memory_occupation", ["kv_cache", "cuda_graph"]),
+            ("resume_memory_occupation", []),
+        ):
+            control_plane.submitted.clear()
+            task = asyncio.create_task(coordinator.admin(action, timeout_s=1))
+            while not control_plane.submitted:
+                await asyncio.sleep(0)
+            with pytest.raises(RuntimeError, match="memory is released"):
+                await coordinator.submit_request("new", "hello")
+            stage, _, message = control_plane.submitted[0]
+            coordinator.handle_admin_result(
+                AdminResult(
+                    op_id=message.operation.op_id,
+                    stage=stage,
+                    action=action,
+                    success=True,
+                    data={"offload_tags": remaining},
+                )
+            )
+            assert (await task)["success"]
+            if remaining:
+                with pytest.raises(RuntimeError, match="memory is released"):
+                    await coordinator.submit_request("new", "hello")
+        await coordinator.submit_request("new", "hello")
+
+    asyncio.run(asyncio.wait_for(run(), timeout=3))
