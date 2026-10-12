@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import importlib
 import logging
 import multiprocessing
 import os
@@ -435,6 +436,12 @@ def stage_process_main(
         for stage_spec in spec.stage_specs:
             prepare_accelerator_environment(stage_spec, log)
         apply_gpu_compat_env_defaults()
+        if any(stage.enable_memory_saver for stage in spec.stage_specs):
+            # note (Codex): Optional backend imports may configure the allocator before its first region.
+            importlib.import_module("sglang.srt.model_executor.model_runner")
+            from torch_memory_saver import torch_memory_saver
+
+            torch_memory_saver.hook_mode = "preload"
         prepare_weight_share_process_compat()
         run_process(spec, ready_event, log)
     except (KeyboardInterrupt, SystemExit):
