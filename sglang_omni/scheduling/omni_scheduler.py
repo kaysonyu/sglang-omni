@@ -2094,6 +2094,8 @@ class OmniScheduler:
             if action == ADMIN_RELEASE_MEMORY:
                 if self.active_request_ids():
                     raise ValueError("Memory release requires an idle engine")
+                if not self.offload_tags:
+                    self.continue_after_memory_resume = not self._engine_paused
                 self._engine_paused = True
                 tags = [tag for tag in requested if tag not in self.offload_tags]
                 if tags:

@@ -713,3 +713,34 @@ def test_memory_control_distinguishes_cpu_stages_from_unconfigured_gpu_stages(
         assert result.success and result.data["offload_tags"] == []
     else:
         assert not result.success and "not enabled" in result.error
+
+
+@pytest.mark.parametrize("initially_paused", [False, True])
+def test_memory_roundtrip_restores_existing_generation_state(
+    initially_paused: bool,
+) -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._admin_lock = threading.Lock()
+    scheduler._engine_paused = initially_paused
+    scheduler.continue_after_memory_resume = False
+    scheduler.offload_tags = set()
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: []
+    scheduler.empty_torch_cache = lambda: None
+    scheduler.memory_occupation = SimpleNamespace(
+        memory_saver_adapter=SimpleNamespace(enabled=True),
+        release_memory_occupation=lambda request: scheduler.offload_tags.update(
+            request.tags
+        ),
+        resume_memory_occupation=lambda request: scheduler.offload_tags.difference_update(
+            request.tags
+        ),
+    )
+    scheduler.admin_memory_occupation("release_memory_occupation", {})
+    scheduler.admin_memory_occupation("release_memory_occupation", {})
+    assert scheduler._engine_paused
+    restored = scheduler.admin_memory_occupation("resume_memory_occupation", {})
+    assert restored["data"]["offload_tags"] == []
+    assert restored["data"]["engine_paused"] == initially_paused
