@@ -56,8 +56,8 @@ def score_prism_actions(
     code_logprobs = torch.empty(
         predictions, model.n_vq, dtype=torch.float32, device=hidden.device
     )
-    stop_probabilities = torch.empty(
-        predictions, dtype=torch.float32, device=hidden.device
+    stop_logprobs = torch.empty(
+        predictions, 2, dtype=torch.float32, device=hidden.device
     )
 
     def read_site(index: int, value: torch.Tensor) -> torch.Tensor | None:
@@ -75,7 +75,7 @@ def score_prism_actions(
                     logits = F.linear(
                         normalized.float(), model.stop_head.weight.float()
                     )
-                stop_probabilities[start:stop] = logits.softmax(dim=-1)[:, 1]
+                stop_logprobs[start:stop] = logits.log_softmax(dim=-1)
             for head in heads:
                 logits = model.audio_lm_heads[head - 1](normalized)
                 code_logprobs[start:stop, head - 1] = selected_action_logprobs(
@@ -109,7 +109,8 @@ def score_prism_actions(
         next_token_logits=None,
         customized_info={
             "code_logprobs": code_logprobs,
-            "stop_probabilities": stop_probabilities,
+            "stop_logprobs": stop_logprobs,
+            "stop_probabilities": stop_logprobs[:, 1].exp(),
         },
     )
 
@@ -314,9 +315,11 @@ class PrismScoreModelRunner(ModelRunner):
     ) -> None:
         scores = result.logits_output.customized_info
         code_logprobs = scores["code_logprobs"].cpu()
+        stop_logprobs = scores["stop_logprobs"].cpu()
         probabilities = scores["stop_probabilities"].cpu()
         if (
             not torch.isfinite(code_logprobs).all()
+            or not torch.isfinite(stop_logprobs).all()
             or not torch.isfinite(probabilities).all()
         ):
             raise RuntimeError("Prism teacher scores must be finite")
@@ -331,6 +334,9 @@ class PrismScoreModelRunner(ModelRunner):
                     cursor : cursor + len(sample.codes)
                 ].tolist(),
                 stop_probabilities=probabilities[
+                    cursor : cursor + sample.prediction_count
+                ].tolist(),
+                stop_logprobs=stop_logprobs[
                     cursor : cursor + sample.prediction_count
                 ].tolist(),
                 finish_reason=sample.finish_reason,

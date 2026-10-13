@@ -260,8 +260,13 @@ def tiny_teacher() -> MossTTSPrismSGLangModel:
 @pytest.mark.parametrize(
     "finish,frames", [("stop", 0), ("stop", 3), ("length", 1), ("length", 3)]
 )
-def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) -> None:
+@pytest.mark.parametrize("stop_scale", [1.0, 1000.0])
+def test_teacher_matches_forced_generation_prefixes(
+    finish: str, frames: int, stop_scale: float
+) -> None:
     model = tiny_teacher()
+    with torch.no_grad():
+        model.stop_head.weight.mul_(stop_scale)
     sample = score_input(finish_reason=finish, frames=frames)
     request = request_for(sample, model)
     runner = PrismScoreModelRunner.__new__(PrismScoreModelRunner)
@@ -279,7 +284,7 @@ def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) ->
         lengths, SimpleNamespace(is_prefill_only=True), [request]
     ).logits_output
     predictions = range(len(sample.prompt_rows) - 1, len(carrier.rows))
-    expected_codes, expected_stop = [], []
+    expected_codes, expected_stop, expected_stop_logprobs = [], [], []
     for frame, position in enumerate(predictions):
         logprobs = torch.empty(1, model.n_vq)
         action = sample.codes[frame] if frame < frames else [0] * model.n_vq
@@ -308,6 +313,7 @@ def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) ->
         )
         expected_codes.append(logprobs[0])
         expected_stop.append(output.next_token_logits.softmax(-1)[0, 1])
+        expected_stop_logprobs.append(output.next_token_logits.log_softmax(-1)[0])
     torch.testing.assert_close(
         actual.customized_info["code_logprobs"][:frames],
         torch.stack(expected_codes)[:frames],
@@ -320,6 +326,16 @@ def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) ->
         atol=2e-6,
         rtol=1e-6,
     )
+    torch.testing.assert_close(
+        actual.customized_info["stop_logprobs"],
+        torch.stack(expected_stop_logprobs),
+        atol=2e-4,
+        rtol=1e-6,
+    )
+    assert torch.isfinite(actual.customized_info["stop_logprobs"]).all()
+    if stop_scale > 1:
+        probabilities = actual.customized_info["stop_probabilities"]
+        assert ((probabilities == 0) | (probabilities == 1)).any()
 
 
 def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
@@ -348,6 +364,7 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
         result = json.loads(score_result(request.data).data["omni_rollout"])
         assert len(result["code_logprobs"]) == len(sample.codes)
         assert len(result["stop_probabilities"]) == sample.prediction_count
+        assert len(result["stop_logprobs"]) == sample.prediction_count
         assert result["input_sha256"] == sample.input_sha256()
         assert result["sample_id"] == sample.sample_id
         assert result["teacher_weight_sha256"] == "frozen"
