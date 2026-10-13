@@ -476,7 +476,7 @@ class ModelWorker:
                 weight_version=payload["weight_version"],
             )
         if success:
-            logger.info(
+            logger.debug(
                 f"Tensor weight update completed tp_rank={self.tp_rank} version={payload.get('weight_version')} format={payload.get('load_format')}"
             )
         return bool(success), str(message)

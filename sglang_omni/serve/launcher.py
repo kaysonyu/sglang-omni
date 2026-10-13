@@ -46,6 +46,7 @@ from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.event_recorder import read_host_boot_id
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
+from sglang_omni.serve.access_logging import configure_access_logging
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
@@ -399,6 +400,7 @@ async def run_server(
     port: int = 8000,
     model_name: str | None = None,
     log_level: str = "info",
+    log_level_http: str = "warning",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
@@ -485,6 +487,7 @@ async def run_server(
             log_level=log_level,
             timeout_keep_alive=120,
         )
+        configure_access_logging(log_level_http)
         server = PipelineUvicornServer(config)
         await serve_with_failure_watch(server, [mp_runner.wait_failed()])
     finally:
@@ -538,6 +541,7 @@ def launch_server(
     port: int = 8000,
     model_name: str | None = None,
     log_level: str = "info",
+    log_level_http: str = "warning",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
@@ -553,6 +557,7 @@ def launch_server(
         model_name: Model name reported in /v1/models responses.
             Defaults to the pipeline name.
         log_level: Uvicorn log level.
+        log_level_http: Minimum severity for HTTP access logs, based on response status.
         client_kwargs: Extra keyword arguments forwarded to
             :class:`~sglang_omni.client.Client`.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
@@ -573,6 +578,7 @@ def launch_server(
             port=port,
             model_name=model_name,
             log_level=log_level,
+            log_level_http=log_level_http,
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
