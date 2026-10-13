@@ -115,6 +115,57 @@ def test_input_hash_and_model_geometry() -> None:
         changed.validate_model(model_config(), 6)
 
 
+@pytest.mark.parametrize("field", ["prompt_rows", "successor_audio_codes", "codes"])
+@pytest.mark.parametrize("invalid", [-1, 17, 2**80])
+def test_audio_vocabulary_rejects_unbounded_integers(field: str, invalid: int) -> None:
+    sample = score_input()
+    values = getattr(sample, field)
+    values[0][1] = invalid
+    with pytest.raises(ValueError, match="Audio code is outside"):
+        sample.validate_model(model_config(), 128)
+
+
+def test_minimal_stop_preserves_input_and_hash() -> None:
+    sample = PrismScoreInput(
+        sample_id="empty",
+        layout="moss_prism_typed_v1",
+        prompt_rows=[[7, 0, 0, 0]],
+        item_kind=[0],
+        audio_role=[0],
+        successor_audio_mask=[False],
+        successor_audio_codes=[[0, 0, 0]],
+        target_history_retention_mask=[[True, True, True]],
+        codes=[],
+        finish_reason="stop",
+    )
+    original = sample.model_dump()
+    digest = sample.input_sha256()
+    sample.validate_model(model_config(), 1)
+    assert sample.model_dump() == original
+    assert sample.input_sha256() == digest
+
+
+@pytest.mark.parametrize(
+    "corruption", ["text_audio", "audio_text", "successor", "anchor"]
+)
+def test_prompt_roles_and_reference_edges_remain_strict(corruption: str) -> None:
+    sample = score_input()
+    if corruption == "text_audio":
+        sample.prompt_rows[2][1] = 1
+        expected = "item_kind"
+    elif corruption == "audio_text":
+        sample.prompt_rows[1][0] = 5
+        expected = "item_kind"
+    elif corruption == "successor":
+        sample.successor_audio_mask[0] = False
+        expected = "successor"
+    else:
+        sample.prompt_rows[0][0] = 5
+        expected = "anchor"
+    with pytest.raises(ValueError, match=expected):
+        sample.validate_model(model_config(), 128)
+
+
 @pytest.mark.parametrize(
     "updates",
     [
