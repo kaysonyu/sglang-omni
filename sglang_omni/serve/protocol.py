@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
+from sglang_omni.model_runner.weight_publication import WeightPublicationPart
+
 
 class UsageResponse(BaseModel):
     """Token usage statistics."""
@@ -639,6 +641,7 @@ class UpdateWeightsFromTensorRequest(AdminRequestBase):
     disable_draft_model: bool | None = None
     torch_empty_cache: bool = False
     keep_pause: bool = False
+    publication: WeightPublicationPart | None = None
 
 
 class MemoryOccupationRequest(AdminRequestBase):

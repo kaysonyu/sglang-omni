@@ -744,3 +744,49 @@ def test_memory_roundtrip_restores_existing_generation_state(
     restored = scheduler.admin_memory_occupation("resume_memory_occupation", {})
     assert restored["data"]["offload_tags"] == []
     assert restored["data"]["engine_paused"] == initially_paused
+
+
+def test_tensor_publication_requires_every_declared_bucket_before_resume() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_tensor=lambda payload: (True, "ok")
+    )
+    scheduler._admin_lock = threading.Lock()
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler.offload_tags = set()
+    scheduler._engine_paused = True
+    scheduler._last_pause_mode = "in_place"
+    scheduler._prompt_cache_epoch = 0
+    scheduler.waiting_queue = []
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: []
+    scheduler.flush_cache = lambda: True
+    scheduler.empty_torch_cache = lambda: None
+
+    def bucket(index: int, *, manifest: str = "a" * 64) -> dict:
+        return {
+            "serialized_named_tensors": ["fixture"],
+            "weight_version": "7",
+            "keep_pause": True,
+            "publication": {
+                "manifest_sha256": manifest,
+                "bucket_count": 2,
+                "bucket_index": index,
+            },
+        }
+
+    first = scheduler.admin_update_weights_from_tensor(bucket(0))
+    assert first["success"] and not first["data"]["publication"]["complete"]
+    with pytest.raises(RuntimeError, match="incomplete"):
+        scheduler.admin_continue_generation({})
+    with pytest.raises(ValueError, match="changed"):
+        scheduler.admin_update_weights_from_tensor(bucket(1, manifest="b" * 64))
+    with pytest.raises(RuntimeError, match="failed"):
+        scheduler.admin_continue_generation({})
+    scheduler.admin_pause_generation({"mode": "in_place"})
+    scheduler.admin_update_weights_from_tensor(bucket(0))
+    second = scheduler.admin_update_weights_from_tensor(bucket(1))
+    assert second["data"]["publication"]["complete"]
+    assert scheduler.admin_continue_generation({})["data"]["engine_paused"] is False

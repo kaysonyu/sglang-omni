@@ -46,6 +46,10 @@ from sglang.srt.runtime_context import get_model, get_serving
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.admission import QueueFullError
+from sglang_omni.model_runner.weight_publication import (
+    WeightPublication,
+    WeightPublicationPart,
+)
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import (
     emit_model_path_end as _emit_model_path_end,
@@ -189,6 +193,8 @@ class OmniScheduler:
         ``process_input_requests``, ``run_batch``, ``send_to_tokenizer``)
         are defined directly on this class and take precedence.
     """
+
+    weight_publication: WeightPublication | None = None
 
     def __init__(
         self,
@@ -2031,6 +2037,11 @@ class OmniScheduler:
                 "model_path": get_model().model_path,
                 "load_format": get_model().load_format,
                 "weight_version": get_serving().weight_version,
+                "publication": (
+                    self.weight_publication.snapshot()
+                    if self.weight_publication is not None
+                    else None
+                ),
             }
         )
         return {"success": True, "message": "ok", "data": info}
@@ -2048,6 +2059,7 @@ class OmniScheduler:
             self._engine_paused = True
             self.continue_after_memory_resume = False
             self._last_pause_mode = mode
+            self.weight_publication = None
             self.resolve_pending_async()
             num_paused = 0
             if mode == "abort":
@@ -2066,6 +2078,13 @@ class OmniScheduler:
 
     def admin_continue_generation(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._admin_lock:
+            if (
+                self.weight_publication is not None
+                and not self.weight_publication.complete
+            ):
+                raise RuntimeError(
+                    "Cannot resume an incomplete or failed weight publication"
+                )
             if bool(payload.get("torch_empty_cache", True)):
                 self.empty_torch_cache()
             self.continue_after_memory_resume = bool(self.offload_tags)
@@ -2220,14 +2239,44 @@ class OmniScheduler:
     def admin_update_weights_from_tensor(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        return self.run_weight_update_with_lifecycle(
+        publication = payload.get("publication")
+        if publication is not None:
+            part = WeightPublicationPart.model_validate(publication)
+            if not payload.get("keep_pause") or not payload.get("flush_cache", True):
+                raise ValueError(
+                    "Publication buckets must keep generation paused and flush stale caches"
+                )
+            version = payload.get("weight_version")
+            if not isinstance(version, str) or not version:
+                raise ValueError(
+                    "A tensor publication requires an explicit weight version"
+                )
+            if not self._engine_paused:
+                raise RuntimeError(
+                    "Pause generation before beginning a tensor publication"
+                )
+            if self.weight_publication is None:
+                self.weight_publication = WeightPublication(
+                    version=version,
+                    manifest_sha256=part.manifest_sha256,
+                    bucket_count=part.bucket_count,
+                )
+            self.weight_publication.begin_part(part, version)
+        elif self.weight_publication is not None:
+            self.weight_publication.failed = True
+            raise ValueError(
+                "Every bucket in an active publication requires its manifest"
+            )
+        result = self.run_weight_update_with_lifecycle(
             payload,
             self.model_worker.update_weights_from_tensor,
-            {
-                "metadata_only": payload.get("serialized_named_tensors") is None,
-            },
+            {"metadata_only": payload.get("serialized_named_tensors") is None},
             keep_pause_on_failure=True,
         )
+        if publication is not None and result["success"]:
+            self.weight_publication.finish_part()
+            result["data"]["publication"] = self.weight_publication.snapshot()
+        return result
 
     def admin_update_weights_from_distributed(
         self, payload: dict[str, Any]
