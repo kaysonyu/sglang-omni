@@ -66,6 +66,10 @@ synchronizes the copy before acknowledging it. A failed tensor update leaves
 the scheduler paused because tensor loading is non-transactional. The Python
 router retains its HTTP 501 response for this route: colocated trainers address
 their corresponding worker directly rather than broadcasting local handles.
+An optional `publication` manifest adds ordered bucket acknowledgements and
+prevents `/continue_generation` from accepting a partial or failed publication.
+Its fields and complete-retry sequence are documented in
+[Colocated RL](colocated_rl.md).
 
 The memory occupation endpoints release and restore weights, KV cache and CUDA
 graph allocations when `enable_memory_saver: true` is configured. See

@@ -15,6 +15,35 @@ so the producer can then release that bucket. Failed updates leave generation
 paused. A multi-bucket publication should use `keep_pause: true` for every bucket
 and call `/continue_generation` only after all buckets succeed.
 
+For server-side completeness checks, include `publication` on every tensor
+request, together with the same nonempty `weight_version`:
+
+```json
+{
+  "weight_version": "42",
+  "keep_pause": true,
+  "flush_cache": true,
+  "publication": {
+    "manifest_sha256": "<64 lowercase hexadecimal characters>",
+    "bucket_count": 16,
+    "bucket_index": 0
+  }
+}
+```
+
+Pause explicitly before bucket zero. Keep the manifest and count fixed and send
+indices in order from zero through `bucket_count - 1`. The manifest identifies
+the sender's parameter plan; it is not a hash of every updated tensor byte.
+Successful acknowledgements and `/model_info` expose `publication.received`,
+`failed`, and `complete`. `/continue_generation` rejects incomplete or failed
+publications. A visible weight version alone does not establish completeness.
+
+Loading remains in place, without rollback. After a failure, explicitly pause
+again to open a fresh attempt and resend the entire publication before resuming.
+Duplicate, missing, reordered, or mismatched buckets fail the current attempt.
+Legacy clients may omit `publication`; they retain responsibility for checking
+every bucket before continuing generation.
+
 Set `enable_memory_saver: true` on the pipeline to enable memory release. Engine
 stages use SGLang's memory saver for weights, KV cache, and CUDA graphs. Other GPU
 stages construct their models and persistent state in separate allocator regions

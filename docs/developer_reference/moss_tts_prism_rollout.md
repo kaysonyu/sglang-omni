@@ -146,7 +146,12 @@ response = requests.post(teacher_url + "/score_actions", json={"samples": [sampl
 
 The teacher forces the supplied codes without sampling or applying its stop
 threshold. Each result contains selected `code_logprobs` of shape `[frames, n_vq]`
-and the original `stop_probabilities`. Temperature scales only the RVQ logits.
+and the original `stop_probabilities`. It also returns `stop_logprobs` of shape
+`[observations, 2]`, with columns for continue and stop. These use FP32
+log-softmax directly, preserving finite selected-action scores even when a
+compatibility probability rounds to zero or one. This is an additive field in
+response version 1; clients computing action losses should prefer it to taking
+the logarithm of `stop_probabilities`. Temperature scales only the RVQ logits.
 Natural stops include the final stop observation; length-limited trajectories
 do not. Zero-frame natural stops return an empty code score list and one stop
 probability. Stop probabilities remain observations, not action logprobs.
@@ -174,6 +179,11 @@ Keep `keep_pause: true` and `flush_cache: true` on every bucket. Omit
 bucket. After all buckets succeed, confirm the version through `/model_info`
 and call `/continue_generation`. The loader writes into existing parameter
 storage, allowing the captured prefill and decode graphs to use the new weights.
+
+The colocated CUDA IPC tensor endpoint additionally supports a tracked
+`publication` manifest. That protocol requires the same explicit weight version
+on every bucket and blocks resume until all buckets are acknowledged. See
+[Colocated RL](colocated_rl.md) for its ordering and recovery contract.
 
 Tensor loading can fail after some weights have changed. In that case, the stage
 stays paused and does not publish the failed bucket's version. Restore a complete
