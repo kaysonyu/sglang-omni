@@ -44,6 +44,7 @@ from sglang_omni.config import PipelineConfig
 from sglang_omni.models.model_capabilities import get_model_capabilities
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.event_recorder import read_host_boot_id
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
@@ -316,6 +317,9 @@ def mount_profiler_routes(
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "server_time_ns": time.time_ns(),
+            "server_monotonic_ns": time.monotonic_ns(),
+            "host_boot_id": read_host_boot_id(),
         }
 
     @router.post("/start_request_profile")
@@ -348,7 +352,13 @@ def mount_profiler_routes(
             event_dir=event_dir,
             enable_torch=False,
         )
-        return {"run_id": run_id, "event_dir": event_dir}
+        return {
+            "run_id": run_id,
+            "event_dir": event_dir,
+            "server_time_ns": time.time_ns(),
+            "server_monotonic_ns": time.monotonic_ns(),
+            "host_boot_id": read_host_boot_id(),
+        }
 
     @router.post("/stop_profile")
     async def stop(req: StopReq):

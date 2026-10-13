@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import base64
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,6 +18,7 @@ from sglang_omni.client.types import (
     GenerateRequest,
     UsageInfo,
 )
+from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import build_rollout_generate_request
@@ -53,6 +56,36 @@ def _text_result() -> CompletionResult:
         output_token_logprobs=[[-0.1, 11], [-0.2, 22]],
         weight_version="v3",
     )
+
+
+def test_generate_profile_links_http_to_pipeline_without_changing_response(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_app(_RolloutClient(_text_result()), model_name="qwen3-omni")
+    )
+    payload = {"prompt": "hello", "return_logprob": True}
+    expected = client.post("/generate", json=payload)
+    recorder = get_recorder()
+    path = recorder.start("generate-http", str(tmp_path), "coordinator")
+    try:
+        response = client.post(
+            "/generate", json=payload, headers={"x-omni-profile-id": "worker-request"}
+        )
+    finally:
+        recorder.stop()
+    assert response.status_code == expected.status_code == 200
+    assert response.content == expected.content
+    events = [json.loads(line) for line in Path(path).read_text().splitlines()]
+    link = next(
+        event for event in events if event["event_name"] == "generate_validated"
+    )
+    assert link["metadata"]["http_request_id"] == "worker-request"
+    encoded = next(
+        event for event in events if event["event_name"] == "generate_response_encoded"
+    )
+    assert encoded["request_id"] == link["request_id"]
+    assert encoded["metadata"]["bytes"] == len(response.content)
 
 
 def test_generate_returns_miles_meta_info() -> None:

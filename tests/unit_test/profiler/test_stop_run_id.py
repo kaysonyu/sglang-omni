@@ -18,11 +18,33 @@ wildcard: stop whatever's active.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+import sglang_omni.profiler.torch_profiler as torch_profiler
 from sglang_omni.profiler.event_recorder import get_recorder, reset_active_stage
 from sglang_omni.proto.messages import ProfilerStopMessage
+
+
+def test_repeated_torch_profile_start_reuses_the_same_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = MagicMock()
+    monkeypatch.setattr(torch_profiler, "profile", factory)
+    monkeypatch.setattr(torch_profiler.TorchProfiler, "_profiler", None)
+    monkeypatch.setattr(torch_profiler.TorchProfiler, "_active_run_id", None)
+    monkeypatch.setattr(torch_profiler.TorchProfiler, "_trace_template", "")
+    first = torch_profiler.TorchProfiler.start(
+        str(tmp_path / "trace"), run_id="shared-process"
+    )
+    repeated = torch_profiler.TorchProfiler.start(
+        str(tmp_path / "trace"), run_id="shared-process"
+    )
+    assert first == repeated
+    factory.assert_called_once()
+    factory.return_value.start.assert_called_once()
+    torch_profiler.TorchProfiler.stop(run_id="shared-process")
 
 
 @pytest.fixture(autouse=True)
