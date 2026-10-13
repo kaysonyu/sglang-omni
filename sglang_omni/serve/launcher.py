@@ -285,6 +285,13 @@ def mount_profiler_routes(
                         "SGLANG_TORCH_PROFILER_DIR is not set"
                     ),
                 )
+            try:
+                tpl.format(run_id=run_id, stage="stage")
+            except (KeyError, IndexError, ValueError, AttributeError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="trace_path_template supports run_id and stage placeholders; PID is appended automatically",
+                ) from error
         else:
             if event_dir is None:
                 raise HTTPException(
