@@ -39,6 +39,7 @@ from sglang_omni.scheduling.types import ARRequestData, SchedulerRequest
 class PrismScoreInputs(PrismInputs):
     prediction_indices: torch.Tensor
     actions: torch.Tensor
+    stop_actions: torch.Tensor
     temperatures: torch.Tensor
 
 
@@ -56,8 +57,8 @@ def score_prism_actions(
     code_logprobs = torch.empty(
         predictions, model.n_vq, dtype=torch.float32, device=hidden.device
     )
-    stop_logprobs = torch.empty(
-        predictions, 2, dtype=torch.float32, device=hidden.device
+    selected_stop_logprobs = torch.empty(
+        predictions, dtype=torch.float32, device=hidden.device
     )
 
     def read_site(index: int, value: torch.Tensor) -> torch.Tensor | None:
@@ -75,7 +76,11 @@ def score_prism_actions(
                     logits = F.linear(
                         normalized.float(), model.stop_head.weight.float()
                     )
-                stop_logprobs[start:stop] = logits.log_softmax(dim=-1)
+                selected_stop_logprobs[start:stop] = (
+                    logits.log_softmax(dim=-1)
+                    .gather(-1, inputs.stop_actions[start:stop, None])
+                    .squeeze(-1)
+                )
             for head in heads:
                 logits = model.audio_lm_heads[head - 1](normalized)
                 code_logprobs[start:stop, head - 1] = selected_action_logprobs(
@@ -109,8 +114,7 @@ def score_prism_actions(
         next_token_logits=None,
         customized_info={
             "code_logprobs": code_logprobs,
-            "stop_logprobs": stop_logprobs,
-            "stop_probabilities": stop_logprobs[:, 1].exp(),
+            "selected_stop_logprobs": selected_stop_logprobs,
         },
     )
 
@@ -252,7 +256,7 @@ class PrismScoreModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> GenerationBatchResult:
         assert schedule_batch.is_prefill_only
-        indices, actions, temperatures = [], [], []
+        indices, actions, stop_actions, temperatures = [], [], [], []
         cursor = 0
         inputs = []
         for length, request in zip(
@@ -267,6 +271,10 @@ class PrismScoreModelRunner(ModelRunner):
             actions.extend(
                 sample.codes
                 + ([[0] * self.model.n_vq] if sample.finish_reason == "stop" else [])
+            )
+            stop_actions.extend(
+                [0] * len(sample.codes)
+                + ([1] if sample.finish_reason == "stop" else [])
             )
             temperatures.extend([sample.temperature] * sample.prediction_count)
             inputs.append(carrier)
@@ -289,6 +297,9 @@ class PrismScoreModelRunner(ModelRunner):
                 indices, dtype=torch.long, device=self.device
             ),
             actions=torch.tensor(actions, dtype=torch.long, device=self.device),
+            stop_actions=torch.tensor(
+                stop_actions, dtype=torch.long, device=self.device
+            ),
             temperatures=torch.tensor(
                 temperatures, dtype=torch.float32, device=self.device
             ),
@@ -315,28 +326,23 @@ class PrismScoreModelRunner(ModelRunner):
     ) -> None:
         scores = result.logits_output.customized_info
         code_logprobs = scores["code_logprobs"].cpu()
-        stop_logprobs = scores["stop_logprobs"].cpu()
-        probabilities = scores["stop_probabilities"].cpu()
+        selected_stop_logprobs = scores["selected_stop_logprobs"].cpu()
         if (
             not torch.isfinite(code_logprobs).all()
-            or not torch.isfinite(stop_logprobs).all()
-            or not torch.isfinite(probabilities).all()
+            or not torch.isfinite(selected_stop_logprobs).all()
         ):
             raise RuntimeError("Prism teacher scores must be finite")
         cursor = 0
         for request in requests:
             sample = request.data.score
             request.data.score_result = PrismScoreResult(
-                version=1,
+                version=2,
                 sample_id=sample.sample_id,
                 input_sha256=sample.input_sha256(),
                 code_logprobs=code_logprobs[
                     cursor : cursor + len(sample.codes)
                 ].tolist(),
-                stop_probabilities=probabilities[
-                    cursor : cursor + sample.prediction_count
-                ].tolist(),
-                stop_logprobs=stop_logprobs[
+                selected_stop_logprobs=selected_stop_logprobs[
                     cursor : cursor + sample.prediction_count
                 ].tolist(),
                 finish_reason=sample.finish_reason,

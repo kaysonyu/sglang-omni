@@ -134,7 +134,7 @@ Send up to 64 samples to `POST /score_actions`. Build each sample from a rollout
 
 ```python
 sample = {
-    "version": 1,
+    "version": 2,
     "sample_id": "sample-001",
     **trace["replay_inputs"],
     "codes": trace["action_streams"][0]["actions"],
@@ -145,16 +145,20 @@ response = requests.post(teacher_url + "/score_actions", json={"samples": [sampl
 ```
 
 The teacher forces the supplied codes without sampling or applying its stop
-threshold. Each result contains selected `code_logprobs` of shape `[frames, n_vq]`
-and the original `stop_probabilities`. It also returns `stop_logprobs` of shape
-`[observations, 2]`, with columns for continue and stop. These use FP32
-log-softmax directly, preserving finite selected-action scores even when a
-compatibility probability rounds to zero or one. This is an additive field in
-response version 1; clients computing action losses should prefer it to taking
-the logarithm of `stop_probabilities`. Temperature scales only the RVQ logits.
-Natural stops include the final stop observation; length-limited trajectories
-do not. Zero-frame natural stops return an empty code score list and one stop
-probability. Stop probabilities remain observations, not action logprobs.
+threshold. Version 2 results contain selected `code_logprobs` of
+shape `[frames, n_vq]` and `selected_stop_logprobs` of shape `[observations]`.
+The student actions are determined by the trajectory: one continue for every
+frame, followed by a stop only when `finish_reason` is `stop`. The teacher
+selects these actions directly from FP32 log-softmax scores before returning
+them. It does not return probabilities or unselected stop scores. This preserves
+finite logprobs even for actions whose probabilities would underflow to zero.
+Temperature scales only the RVQ logits. Natural stops include the final stop
+observation; length-limited trajectories do not. Zero-frame natural stops return
+an empty code score list and one selected stop logprob.
+
+The HTTP batch envelope remains version 1; each Prism sample and result uses
+version 2. Upgrade the scoring client and teacher together. Version 1 Prism
+requests are rejected rather than served with a different response shape.
 
 Results preserve input order and carry `sample_id`, `input_sha256`, model identity,
 and the teacher's weight version and parameter checksum. The input hash covers

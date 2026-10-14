@@ -21,7 +21,7 @@ from transformers import PretrainedConfig
 
 class PrismScoreInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     sample_id: str = Field(min_length=1)
     layout: Literal["moss_prism_typed_v1"]
     prompt_rows: list[list[StrictInt]] = Field(min_length=1)
@@ -136,12 +136,11 @@ class PrismScoreBatch(BaseModel):
 
 
 class PrismScoreResult(TypedDict):
-    version: int
+    version: Literal[2]
     sample_id: str
     input_sha256: str
     code_logprobs: list[list[float]]
-    stop_probabilities: list[float]
-    stop_logprobs: list[list[float]]
+    selected_stop_logprobs: list[float]
     finish_reason: str
     temperature: float
     weight_version: str
