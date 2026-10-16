@@ -74,9 +74,15 @@ class MossTTSPrismPipelineConfig(PipelineConfig):
         if stage_name == "tts_engine" and self.enable_rl:
             return {"enable_rl": True}
         if stage_name == "vocoder":
+            if self.enable_memory_saver and self.vocoder_cuda_graph is True:
+                raise ValueError(
+                    "Prism memory offload requires vocoder_cuda_graph=false"
+                )
             return {
                 "codec_model_path": self.codec_model_path,
-                "vocoder_cuda_graph": self.vocoder_cuda_graph,
+                "vocoder_cuda_graph": (
+                    False if self.enable_memory_saver else self.vocoder_cuda_graph
+                ),
             }
         if stage_name == "preprocessing":
             return {"codec_model_path": self.codec_model_path}

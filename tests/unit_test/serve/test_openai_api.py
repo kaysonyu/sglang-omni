@@ -529,6 +529,12 @@ class AdminClient:
         self.calls.append(("update_weights_from_disk", payload, stages, timeout_s))
         return {"success": True, "message": "ok", "results": []}
 
+    async def update_weights_from_tensor(
+        self, payload, *, stages=None, timeout_s=300.0
+    ):
+        self.calls.append(("update_weights_from_tensor", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
     async def init_weights_update_group(
         self,
         payload: dict[str, Any],
@@ -3503,14 +3509,52 @@ def test_admin_routes_env_key_is_used_when_no_explicit_key(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unimplemented_tensor_weight_update_returns_501() -> None:
+@pytest.mark.parametrize("keep_pause", [False, True])
+def test_tensor_weight_update_routes_rank_handles_and_lifecycle(keep_pause):
     admin = AdminClient()
     client = TestClient(create_app(admin, model_name="qwen3-omni"))
+    response = client.post(
+        "/update_weights_from_tensor",
+        json={
+            "serialized_named_tensors": ["rank-zero", "rank-one"],
+            "load_format": "flattened_bucket",
+            "weight_version": "7",
+            "keep_pause": keep_pause,
+            "stages": ["talker"],
+            "timeout_s": 12,
+        },
+    )
+    assert response.status_code == 200
+    action, payload, stages, timeout = admin.calls[-1]
+    assert action == "update_weights_from_tensor"
+    assert payload["serialized_named_tensors"] == ["rank-zero", "rank-one"]
+    assert payload["keep_pause"] == keep_pause
+    assert payload["weight_version"] == "7"
+    assert stages == ["talker"] and timeout == 12
 
-    resp = client.post("/update_weights_from_tensor", json={})
-    assert resp.status_code == 501
-    assert resp.json()["error"]["code"] == "not_implemented"
-    assert "update_weights_from_disk" in resp.json()["error"]["message"]
+
+@pytest.mark.parametrize("serialized", [None, [], [2]])
+def test_tensor_weight_update_rejects_invalid_rank_handles(serialized):
+    admin = AdminClient()
+    client = TestClient(create_app(admin, model_name="qwen3-omni"))
+    response = client.post(
+        "/update_weights_from_tensor", json={"serialized_named_tensors": serialized}
+    )
+    assert response.status_code == 422
+    assert not admin.calls
+
+
+@pytest.mark.parametrize(
+    "action", ["release_memory_occupation", "resume_memory_occupation"]
+)
+def test_memory_occupation_routes_tags_to_pipeline(action):
+    admin = AdminClient()
+    client = TestClient(create_app(admin, model_name="qwen3-omni"))
+    response = client.post(
+        f"/{action}", json={"tags": ["weights"], "stages": ["talker"]}
+    )
+    assert response.status_code == 200
+    assert admin.calls[-1] == (action, {"tags": ["weights"]}, ["talker"], 300.0)
 
 
 @pytest.mark.parametrize("keep_pause", [None, False, True])
@@ -3594,8 +3638,8 @@ def test_distributed_weight_update_routes_forward_to_client(
     ]
 
 
-def test_stub_endpoint_checks_auth_before_501() -> None:
-    """Auth check fires before the tensor stub 501 body."""
+def test_tensor_endpoint_checks_auth_before_deserialization() -> None:
+    """Tensor handles require administrative authentication."""
     admin = AdminClient()
     client = TestClient(
         create_app(admin, model_name="qwen3-omni", admin_api_key=_ADMIN_API_KEY)

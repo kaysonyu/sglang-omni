@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import (
     needs_quant_config_normalization,
@@ -443,13 +445,41 @@ class ModelWorker:
         return bool(success), str(message)
 
     def update_weights_from_tensor(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        if payload.get("serialized_named_tensors") is not None:
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.utils import MultiprocessingSerializer
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+        serialized = payload.get("serialized_named_tensors")
+        if (
+            not isinstance(serialized, list)
+            or len(serialized) != get_parallel().tp_size
+        ):
             return (
                 False,
-                "update_weights_from_tensor requires a tensor data plane; "
-                "Omni admin control plane only carries metadata",
+                "serialized_named_tensors must contain one payload per TP rank",
             )
-        return self.call_optional_weight_method("update_weights_from_tensor", payload)
+        if any(not isinstance(value, str) or not value for value in serialized):
+            return False, "serialized_named_tensors must contain non-empty strings"
+        monkey_patch_torch_reductions()
+        tensors = MultiprocessingSerializer.deserialize(serialized[self.tp_rank])
+        try:
+            success, message = self.model_runner.update_weights_from_tensor(
+                named_tensors=tensors, load_format=payload.get("load_format")
+            )
+        finally:
+            # note (Codex): The producer may free its IPC bucket as soon as this call returns.
+            torch.get_device_module(self.model_runner.device).synchronize()
+        if success and payload.get("weight_version") is not None:
+            override_server_args(
+                self.server_args,
+                "sglang-omni-weight-update-tensor",
+                weight_version=payload["weight_version"],
+            )
+        if success:
+            logger.debug(
+                f"Tensor weight update completed tp_rank={self.tp_rank} version={payload.get('weight_version')} format={payload.get('load_format')}"
+            )
+        return bool(success), str(message)
 
     def init_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
         init = self.model_runner.init_weights_update_group

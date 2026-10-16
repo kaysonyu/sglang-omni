@@ -93,6 +93,7 @@ from sglang_omni.serve.protocol import (
     GenerateMetaInfo,
     GenerateResponse,
     InitWeightsUpdateGroupRequest,
+    MemoryOccupationRequest,
     ModelCard,
     ModelList,
     PauseGenerationRequest,
@@ -101,6 +102,7 @@ from sglang_omni.serve.protocol import (
     SpeechBatchResponse,
     UpdateWeightFromDiskRequest,
     UpdateWeightsFromDistributedRequest,
+    UpdateWeightsFromTensorRequest,
     UsageResponse,
     VoiceListResponse,
     WeightsCheckerRequest,
@@ -519,19 +521,39 @@ def register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
 
     @app.post("/update_weights_from_tensor", dependencies=[Depends(_auth)])
     async def update_weights_from_tensor(
-        request: Request,
+        req: UpdateWeightsFromTensorRequest,
     ) -> JSONResponse:
-        return JSONResponse(
-            status_code=501,
-            content={
-                "error": {
-                    "message": (
-                        "update_weights_from_tensor is not yet implemented. "
-                        "Use update_weights_from_disk for the disk-based weight update path."
-                    ),
-                    "code": "not_implemented",
-                }
-            },
+        client: Client = app.state.client
+        return admin_response(
+            await client.update_weights_from_tensor(
+                request_payload(req),
+                stages=req.stages,
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
+            )
+        )
+
+    @app.post("/release_memory_occupation", dependencies=[Depends(_auth)])
+    async def release_memory_occupation(req: MemoryOccupationRequest) -> JSONResponse:
+        client: Client = app.state.client
+        return admin_response(
+            await client.admin(
+                "release_memory_occupation",
+                request_payload(req),
+                stages=req.stages,
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
+            )
+        )
+
+    @app.post("/resume_memory_occupation", dependencies=[Depends(_auth)])
+    async def resume_memory_occupation(req: MemoryOccupationRequest) -> JSONResponse:
+        client: Client = app.state.client
+        return admin_response(
+            await client.admin(
+                "resume_memory_occupation",
+                request_payload(req),
+                stages=req.stages,
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
+            )
         )
 
     @app.post("/init_weights_update_group", dependencies=[Depends(_auth)])

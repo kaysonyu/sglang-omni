@@ -363,6 +363,17 @@ class Client:
             timeout_s=timeout_s,
         )
 
+    async def update_weights_from_tensor(
+        self,
+        payload: dict[str, object],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, object]:
+        return await self._coordinator.update_weights_from_tensor(
+            payload, stages=stages, timeout_s=timeout_s
+        )
+
     async def init_weights_update_group(
         self,
         payload: dict[str, Any],

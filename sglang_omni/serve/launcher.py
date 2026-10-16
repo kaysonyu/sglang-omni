@@ -99,7 +99,10 @@ def find_available_port(host: str, port: int) -> int:
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # note (Codex): Match the HTTP listener so TIME_WAIT does not reject a supervised restart.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, port))
+            s.listen(1)
             return port
     except OSError as exc:
         if (os.environ.get("SGLANG_OMNI_STRICT_PORT") or "").strip() == "1":

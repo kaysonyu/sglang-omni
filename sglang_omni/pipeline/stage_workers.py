@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import importlib
 import logging
 import multiprocessing
 import os
@@ -11,7 +12,7 @@ import queue
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
@@ -21,6 +22,7 @@ from sglang_omni.config.runtime import (
 )
 from sglang_omni.pipeline.control_plane import StageControlPlane
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
+from sglang_omni.pipeline.memory_saver import StageMemorySaver
 from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
@@ -57,6 +59,8 @@ class StageLaunchConfig:
     placement_gpu_id: int | None = None
     gpu_id: int | None = None
     nccl_port: int | None = None
+    enable_memory_saver: bool = False
+    engine_stage: bool = False
 
     # Factory
     factory: str = ""
@@ -293,7 +297,16 @@ class StageGroup:
                 )
                 with patched_spawn_env(spec, extra_env=extra_env):
                     self._process_start_attempts.add(spec.process_name)
-                    proc.start()
+                    if any(stage.enable_memory_saver for stage in spec.stage_specs):
+                        from sglang.srt.utils.torch_memory_saver_adapter import (
+                            TorchMemorySaverAdapter,
+                        )
+
+                        adapter = TorchMemorySaverAdapter.create(enable=True)
+                        with adapter.configure_subprocess():
+                            proc.start()
+                    else:
+                        proc.start()
             except Exception:
                 close_queue(startup_error_channel)
                 raise
@@ -423,6 +436,12 @@ def stage_process_main(
         for stage_spec in spec.stage_specs:
             prepare_accelerator_environment(stage_spec, log)
         apply_gpu_compat_env_defaults()
+        if any(stage.enable_memory_saver for stage in spec.stage_specs):
+            # note (Codex): Optional backend imports may configure the allocator before its first region.
+            importlib.import_module("sglang.srt.model_executor.model_runner")
+            from torch_memory_saver import torch_memory_saver
+
+            torch_memory_saver.hook_mode = "preload"
         prepare_weight_share_process_compat()
         run_process(spec, ready_event, log)
     except (KeyboardInterrupt, SystemExit):
@@ -637,7 +656,12 @@ def construct_stage(
         spec.tp_size,
     )
 
-    scheduler = construct_scheduler(spec, gpu_id, log)
+    memory_saver = None
+    if spec.enable_memory_saver and not spec.engine_stage and gpu_id is not None:
+        memory_saver = StageMemorySaver(
+            tag=f"omni-stage:{spec.stage_name}", gpu_id=gpu_id
+        )
+    scheduler = construct_scheduler(spec, gpu_id, log, memory_saver=memory_saver)
 
     def _target_list(targets: str | list[str] | None) -> list[str]:
         if targets is None:
@@ -789,6 +813,7 @@ def construct_stage(
         input_handler=input_handler,
         comm_config=spec.comm_config,
         scheduler=scheduler,
+        memory_saver=memory_saver,
         project_payload=project_payload or None,
         stream_targets=spec.stream_targets or None,
         get_stream_done_targets=get_stream_done_targets,
@@ -857,6 +882,7 @@ def construct_scheduler(
     spec: StageLaunchConfig,
     gpu_id: int | None,
     log: logging.Logger,
+    memory_saver: StageMemorySaver | None = None,
 ) -> Any:
     """Build a scheduler, serializing GPU factory work per visible device."""
 
@@ -880,10 +906,17 @@ def construct_scheduler(
     )
 
     def _invoke() -> Any:
-        if kv_cache_bytes is None:
-            return factory(**factory_args)
-        with stage_kv_cache_budget(spec.stage_name, kv_cache_bytes):
-            return factory(**factory_args)
+        allocation_region = (
+            memory_saver.adapter.region(memory_saver.tag, enable_cpu_backup=True)
+            if memory_saver is not None
+            else nullcontext()
+        )
+        with allocation_region:
+            if kv_cache_bytes is None:
+                return factory(**factory_args)
+            else:
+                with stage_kv_cache_budget(spec.stage_name, kv_cache_bytes):
+                    return factory(**factory_args)
 
     if gpu_id is None:
         return _invoke()
