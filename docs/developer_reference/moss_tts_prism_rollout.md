@@ -155,10 +155,10 @@ version 2. Upgrade the scoring client and teacher together. Version 1 Prism
 requests are rejected rather than served with a different response shape.
 
 Results preserve input order and carry `sample_id`, `input_sha256`, model identity,
-and the teacher's weight version and parameter checksum. The input hash covers
-canonical validated JSON excluding `sample_id`. `/model_info` advertises scoring
-support and the same checksum reported by `/weights_checker?action=checksum`;
-runtime caches are excluded. The teacher remains fixed during training.
+and the teacher's weight version. The input hash covers canonical validated JSON
+excluding `sample_id`. `/model_info` advertises scoring support and the teacher's
+read-only role through an explicit capability flag. Teacher startup does not
+compute a parameter checksum, and score responses do not carry one.
 
 `tts_engine.factory.score_chunk_size` bounds the number of prediction states
 projected through each scoring head at once (default 128). Scores come from the

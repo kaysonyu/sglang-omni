@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -19,7 +18,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
-from sglang_omni.model_runner.weight_checker import StrictWeightChecker
 from sglang_omni.models.moss_tts_prism.embedding_kernels import feedback_embeddings
 from sglang_omni.models.moss_tts_prism.scoring_protocol import (
     PrismScoreInput,
@@ -348,18 +346,8 @@ class PrismScoreModelRunner(ModelRunner):
                 finish_reason=sample.finish_reason,
                 temperature=sample.temperature,
                 weight_version=self.model.teacher_weight_version,
-                teacher_weight_sha256=self.model.teacher_weight_sha256,
                 logprob_semantics="temperature_scaled_full_vocab_v1",
                 stop_semantics="pre_frame_threshold_v1",
                 model_identity=self.model.model_identity,
             )
             cursor += sample.prediction_count
-
-
-class PrismTeacherWeightChecker(StrictWeightChecker):
-    @staticmethod
-    def iter_named_tensors(
-        model: MossTTSPrismSGLangModel,
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        # note (Zhang Yiyang): Runtime caches are not frozen checkpoint parameters.
-        return model.named_parameters()

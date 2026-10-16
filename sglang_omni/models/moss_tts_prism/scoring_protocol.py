@@ -144,7 +144,6 @@ class PrismScoreResult(TypedDict):
     finish_reason: str
     temperature: float
     weight_version: str
-    teacher_weight_sha256: str
     logprob_semantics: str
     stop_semantics: str
     model_identity: dict[str, str | int | bool]

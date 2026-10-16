@@ -15,7 +15,6 @@ from torch import nn
 from sglang_omni.models.moss_tts_prism.config import MossTTSPrismScorePipelineConfig
 from sglang_omni.models.moss_tts_prism.scoring import (
     PrismScoreModelRunner,
-    PrismTeacherWeightChecker,
     build_score_request,
     score_result,
 )
@@ -226,7 +225,7 @@ def tiny_teacher() -> MossTTSPrismSGLangModel:
     model.n_vq = 3
     model.model = None
     model.decode_inputs = None
-    model.teacher_weight_sha256 = "frozen"
+    model.enable_action_scoring = True
     model.teacher_weight_version = "teacher:0"
     model.model_identity = {"n_vq": 3}
     model.transformer = nn.Module()
@@ -369,7 +368,7 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
         assert "stop_probabilities" not in result and "stop_logprobs" not in result
         assert result["input_sha256"] == sample.input_sha256()
         assert result["sample_id"] == sample.sample_id
-        assert result["teacher_weight_sha256"] == "frozen"
+        assert "teacher_weight_sha256" not in result
         assert result["weight_version"] == "teacher:0"
     first = requests[0].data.score_result
     rows = len(requests[0].data.inputs.rows)
@@ -387,19 +386,17 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
     )
 
 
-def test_teacher_checksum_ignores_runtime_buffers() -> None:
+def test_teacher_capabilities_do_not_depend_on_a_weight_checksum() -> None:
     model = tiny_teacher()
-    model.register_buffer("cache", torch.zeros(2), persistent=False)
-    checker = PrismTeacherWeightChecker(SimpleNamespace(model=model))
-    checksum = checker.checksum()["per_gpu_checksum"]
-    model.cache.add_(1)
-    assert checker.checksum()["per_gpu_checksum"] == checksum
-    with torch.no_grad():
-        model.audio_lm_heads[0].weight.add_(1)
-    assert checker.checksum()["per_gpu_checksum"] != checksum
     metadata = model.rollout_model_info()
-    assert metadata["supports_action_scoring"]
-    assert not metadata["supports_weight_update"]
+    assert metadata["supports_action_scoring"] is True
+    assert metadata["supports_weight_update"] is False
+    assert metadata["weight_version"] == "teacher:0"
+    assert "teacher_weight_sha256" not in metadata
+    model.enable_action_scoring = False
+    metadata = model.rollout_model_info()
+    assert metadata["supports_action_scoring"] is False
+    assert metadata["supports_weight_update"] is True
 
 
 def test_prism_endpoint_dispatch_order_and_validation() -> None:
