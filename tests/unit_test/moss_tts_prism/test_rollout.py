@@ -8,7 +8,6 @@ import pytest
 import torch
 from torch import nn
 
-from sglang_omni.client.client import Client
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_prism.config import MossTTSPrismPipelineConfig
 from sglang_omni.models.moss_tts_prism.model_runner import (
@@ -31,7 +30,6 @@ from sglang_omni.models.moss_tts_prism.sglang_model import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput, SchedulerRequest
-from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
 @pytest.fixture
@@ -669,38 +667,53 @@ def test_prompt_matches_artifact_typed_carrier():
         def encode_data_uri(self, uri):
             return references[0]
 
-    for task, script, count, instruction in [
-        ("TTS", "Hello.", 0, None),
-        ("Instruction", "Hello.", 0, '{"Speed":"slow"}'),
-        ("Full VoiceClone", "Hello.", 1, None),
-        ("Attribute Clone Triplet", "Hello.", 2, None),
-        ("sing clone", "Hello.", 1, None),
-        (
-            "Local Instruction",
-            "Hello. Goodbye.",
-            0,
-            json.dumps(
-                {
-                    "global instruction": {"Speed": "slow"},
-                    "local instruction": [
-                        {"text": "Goodbye.", "local instruction": {"Emotion": "sad"}}
-                    ],
-                }
-            ),
-        ),
-    ]:
-        inputs = {
-            "script": script,
-            "task_type": task,
-            "show_language": True,
-            "language": "English",
-            "tokens_control": True,
-            "global_tokens": 120,
-            "global_instruction": instruction,
-            "references": [
-                {"id": f"audio{i + 1}", "uri": str(i)} for i in range(count)
+    reference_uri = "data:audio/wav;base64,UklGRg=="
+    for inputs in [
+        {"script": "Hello."},
+        {
+            "script": "Hello.",
+            "global_instruction": {"Language": "English", "Speed": "slow"},
+        },
+        {
+            "script": "Hello.",
+            "references": {"audio1": "0"},
+            "reference_attributes": {
+                name: "audio1" for name in ("timbre", "accent", "prosody", "emotion")
+            },
+        },
+        {
+            "script": "Hello.",
+            "references": {"audio1": "0", "audio3": "1"},
+            "reference_attributes": {
+                "timbre": "audio1",
+                "accent": "audio1",
+                "prosody": "audio3",
+                "emotion": "audio3",
+            },
+        },
+        {
+            "modality": "sing",
+            "script": "Hello.",
+            "global_instruction": {
+                "Genre": "Pop",
+                "Mood": "happy",
+                "Language": "English",
+            },
+        },
+        {
+            "script": [
+                {"text": "Hello. "},
+                {"text": "Goodbye.", "local_instruction": {"Emotion": "sad"}},
             ],
-        }
+            "global_instruction": {"Speed": "slow"},
+            "global_tokens": 120,
+        },
+        {
+            "script": "Hello.",
+            "references": {"audio10": reference_uri},
+            "reference_attributes": {"timbre": "audio10"},
+        },
+    ]:
         prepared = preprocess_prism_payload(
             StagePayload(
                 request_id="prompt", request=OmniRequest(inputs=inputs), data={}
@@ -709,50 +722,15 @@ def test_prompt_matches_artifact_typed_carrier():
             reference_encoder=ReferenceEncoder(),
         )
         message = processor.build_user_message(
-            script=script,
-            task_type=task,
-            language="English",
-            tokens=120,
-            global_instruction=instruction,
-            reference=references[:count] or None,
-        )
-        expected = processor([[message]], mode="generation")
-        for name, actual in prepared.data["prism_inputs"].items():
-            torch.testing.assert_close(actual, expected[name][0], rtol=0, atol=0)
-
-    service = SpeechRequestValidator(default_model="prism")
-    reference_uri = "data:audio/wav;base64,UklGRg=="
-    for fields, task in [
-        ({}, "TTS"),
-        ({"instructions": '{"Speed":"slow"}'}, "Instruction"),
-        ({"ref_audio": reference_uri}, "Full VoiceClone"),
-        (
-            {"ref_audio": reference_uri, "instructions": '{"Emotion":"happy"}'},
-            "Instruction Voice Clone",
-        ),
-    ]:
-        speech = service.parse_generation_request(
-            {"input": "Hello.", "language": "English", "token_count": 120, **fields}
-        )
-        request = Client.build_omni_request(
-            service.build_generate_request(
-                speech.request,
-                validate=False,
-                reference_descriptors=speech.reference_descriptors,
-            )
-        )
-        prepared = preprocess_prism_payload(
-            StagePayload(request_id="speech", request=request, data={}),
-            processor=processor,
-            reference_encoder=ReferenceEncoder(),
-        )
-        message = processor.build_user_message(
-            script="Hello.",
-            task_type=task,
-            language="English",
-            tokens=120,
-            global_instruction=fields.get("instructions"),
-            reference=references[:1] if "ref_audio" in fields else None,
+            {
+                **inputs,
+                "references": {
+                    slot: (
+                        references[0] if uri == reference_uri else references[int(uri)]
+                    )
+                    for slot, uri in inputs.get("references", {}).items()
+                },
+            }
         )
         expected = processor([[message]], mode="generation")
         for name, actual in prepared.data["prism_inputs"].items():

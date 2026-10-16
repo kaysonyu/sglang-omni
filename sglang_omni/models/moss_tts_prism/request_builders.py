@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -22,44 +23,44 @@ from sglang_omni.models.moss_tts.request_builders import (
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
 from sglang_omni.models.moss_tts_local.request_builders import (
     MOSS_STREAM_TRANSPORT_BATCH_FRAMES,
-    build_moss_tts_local_state,
+    build_generation_kwargs,
     build_moss_tts_local_stream_metadata,
 )
 from sglang_omni.models.moss_tts_local.stages import MossLocalReferenceEncoder
 from sglang_omni.models.moss_tts_prism.rollout_trace import build_prism_rollout_trace
 from sglang_omni.models.moss_tts_prism.sglang_model import MossTTSPrismSGLangModel
-from sglang_omni.proto import StagePayload
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.types import ARRequestData, RequestOutput
 
 
-class PrismReference(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    id: str = Field(min_length=1)
-    uri: str = Field(min_length=1)
+class PrismScriptSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1)
+    local_instruction: dict[str, str | None] = Field(default_factory=dict)
 
 
 class PrismPrompt(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    script: str = Field(min_length=1)
-    global_instruction: str | None = None
-    task_type: str = Field(min_length=1)
-    show_language: bool
-    language: str | None = None
-    tokens_control: bool = False
+    modality: Literal["speech", "sing"] = "speech"
+    script: str | list[PrismScriptSegment] = Field(min_length=1)
+    global_instruction: dict[str, str | None] = Field(default_factory=dict)
     global_tokens: int | None = Field(default=None, gt=0, strict=True)
-    references: list[PrismReference] = Field(default_factory=list)
+    references: dict[str, str] = Field(default_factory=dict)
+    reference_attributes: dict[
+        Literal["timbre", "accent", "prosody", "emotion"], str
+    ] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_controls(self) -> PrismPrompt:
-        if not self.script.strip() or not self.task_type.strip():
-            raise ValueError("Prism script and task_type must not be blank")
-        elif self.show_language and (not self.language or not self.language.strip()):
-            raise ValueError("Prism show_language requires language")
-        elif self.tokens_control and self.global_tokens is None:
-            raise ValueError("Prism tokens_control requires global_tokens")
-        elif not self.tokens_control and self.global_tokens is not None:
-            raise ValueError("Prism global_tokens requires tokens_control")
+    def validate_script(self) -> PrismPrompt:
+        if isinstance(self.script, str):
+            text = self.script
+        else:
+            text = "".join(segment.text for segment in self.script)
+        if not text.strip():
+            raise ValueError("Prism script must not be blank")
+        elif any(not uri.strip() for uri in self.references.values()):
+            raise ValueError("Prism references must contain nonempty URIs")
         else:
             return self
 
@@ -180,9 +181,21 @@ def preprocess_prism_payload(
     processor: ProcessorMixin,
     reference_encoder: MossLocalReferenceEncoder | None,
 ) -> StagePayload:
-    state = build_moss_tts_local_state(payload)
+    structured = PrismPrompt.model_validate(payload.request.inputs)
     params = dict(payload.request.params or {})
     params.update((params.get("stage_params") or {}).get("tts_engine") or {})
+    state = MossTTSLocalState(
+        generation_kwargs=build_generation_kwargs(
+            params,
+            tts_params={
+                "explicit_generation_params": (payload.request.metadata or {}).get(
+                    EXPLICIT_GENERATION_PARAMS_KEY, []
+                )
+            },
+        ),
+        return_logprob=bool(params.get("return_logprob", False)),
+        return_omni_rollout=bool(params.get("return_omni_rollout", False)),
+    )
     stop_sampling = params.get("stop_sampling", False)
     if type(stop_sampling) is not bool:
         raise ValueError("MOSS-TTS Prism stop_sampling must be a boolean")
@@ -192,86 +205,32 @@ def preprocess_prism_payload(
             raise ValueError(f"MOSS-TTS Prism {name} must be finite")
     for name in ("text_temperature", "text_top_p", "text_top_k"):
         state.generation_kwargs.pop(name)
-    tts_params = (payload.request.metadata or {}).get("tts_params") or {}
-    for source in (params, tts_params):
-        if any(
-            source.get(name) is not None
-            for name in (
-                "text_temperature",
-                "text_top_p",
-                "text_top_k",
-                "execution_rvq_channels",
-                "returned_rvq_channels",
-                "loop_block_prefix_counts",
-            )
-        ):
-            raise ValueError(
-                "MOSS-TTS Prism supports audio sampling and full RVQ execution only"
-            )
-    inputs = payload.request.inputs
-    if isinstance(inputs, str) or (
-        isinstance(inputs, dict)
-        and "script" not in inputs
-        and ("text" in inputs or "input" in inputs)
-    ):
-        if isinstance(inputs, dict) and len(inputs.get("references") or []) > 1:
-            raise ValueError(
-                "MOSS-TTS Prism multiple references require a structured prompt"
-            )
-        requested_task_type = tts_params.get("task_type") or params.get("task_type")
-        if requested_task_type in (None, "Base"):
-            if state.ref_audio is not None:
-                task_type = (
-                    "Instruction Voice Clone"
-                    if state.instructions
-                    else "Full VoiceClone"
-                )
-            elif state.instructions:
-                task_type = "Instruction"
-            else:
-                task_type = "TTS"
-        elif requested_task_type == "VoiceDesign":
-            task_type = "Instruction"
-        else:
-            task_type = requested_task_type
-        structured = PrismPrompt(
-            script=state.text,
-            global_instruction=state.instructions,
-            task_type=task_type,
-            show_language=state.language is not None,
-            language=state.language,
-            tokens_control=state.token_count is not None,
-            global_tokens=state.token_count,
-            references=(
-                [PrismReference(id="audio1", uri=state.ref_audio)]
-                if state.ref_audio is not None
-                else []
-            ),
+    if any(
+        params.get(name) is not None
+        for name in (
+            "text_temperature",
+            "text_top_p",
+            "text_top_k",
+            "execution_rvq_channels",
+            "returned_rvq_channels",
+            "loop_block_prefix_counts",
         )
-    else:
-        structured = PrismPrompt.model_validate(inputs)
-        if state.language is not None:
-            raise ValueError("MOSS-TTS Prism language belongs in the structured prompt")
-        elif state.token_count is not None:
-            raise ValueError(
-                "MOSS-TTS Prism global_tokens belongs in the structured prompt"
-            )
-    references = []
-    for reference in structured.references:
-        uri = reference.uri
+    ):
+        raise ValueError(
+            "MOSS-TTS Prism supports audio sampling and full RVQ execution only"
+        )
+    references = {}
+    for slot, uri in structured.references.items():
+        if reference_encoder is None:
+            raise ValueError("MOSS-TTS Prism references require an audio encoder")
         codes = (
             reference_encoder.encode_data_uri(uri)
             if _DATA_URI_RE.match(uri)
             else reference_encoder.encode(uri)
         )
-        references.append(codes)
+        references[slot] = codes
     message = processor.build_user_message(
-        script=structured.script,
-        reference=references or None,
-        global_instruction=structured.global_instruction,
-        tokens=structured.global_tokens if structured.tokens_control else None,
-        task_type=structured.task_type,
-        language=structured.language if structured.show_language else None,
+        {**structured.model_dump(), "references": references}
     )
     prompt = build_prism_prompt(processor, message)
     return StagePayload(
