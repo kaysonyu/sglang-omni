@@ -18,11 +18,71 @@ wildcard: stop whatever's active.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+import sglang_omni.profiler.torch_profiler as torch_profiler
 from sglang_omni.profiler.event_recorder import get_recorder, reset_active_stage
+from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.proto.messages import ProfilerStopMessage
+from sglang_omni.serve.launcher import mount_profiler_routes
+
+
+@pytest.mark.parametrize(
+    "template", ["trace_{pid}", "trace_{missing}", "trace_{", "trace_{}"]
+)
+def test_invalid_trace_template_is_rejected_before_stage_control(
+    template: str, tmp_path: Path
+) -> None:
+    control = MagicMock(spec=ProfilerControlClient)
+    app = FastAPI()
+    mount_profiler_routes(app, control, str(tmp_path))
+    response = TestClient(app).post(
+        "/start_profile", json={"trace_path_template": template}
+    )
+    assert response.status_code == 400
+    control.broadcast_start.assert_not_awaited()
+    assert not get_recorder().is_active()
+
+
+def test_trace_start_returns_clock_calibration_without_rewriting_template(
+    tmp_path: Path,
+) -> None:
+    control = MagicMock(spec=ProfilerControlClient)
+    app = FastAPI()
+    mount_profiler_routes(app, control, str(tmp_path))
+    template = str(tmp_path / "{run_id}" / "trace_{stage}")
+    response = TestClient(app).post(
+        "/start_profile", json={"run_id": "round-2", "trace_path_template": template}
+    )
+    assert response.status_code == 200
+    assert response.json()["trace_path_template"] == template
+    assert response.json()["server_time_ns"] > 0
+    assert response.json()["server_monotonic_ns"] > 0
+    control.broadcast_start.assert_awaited_once()
+
+
+def test_repeated_torch_profile_start_reuses_the_same_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = MagicMock()
+    monkeypatch.setattr(torch_profiler, "profile", factory)
+    monkeypatch.setattr(torch_profiler.TorchProfiler, "_profiler", None)
+    monkeypatch.setattr(torch_profiler.TorchProfiler, "_active_run_id", None)
+    monkeypatch.setattr(torch_profiler.TorchProfiler, "_trace_template", "")
+    first = torch_profiler.TorchProfiler.start(
+        str(tmp_path / "trace"), run_id="shared-process"
+    )
+    repeated = torch_profiler.TorchProfiler.start(
+        str(tmp_path / "trace"), run_id="shared-process"
+    )
+    assert first == repeated
+    factory.assert_called_once()
+    factory.return_value.start.assert_called_once()
+    torch_profiler.TorchProfiler.stop(run_id="shared-process")
 
 
 @pytest.fixture(autouse=True)

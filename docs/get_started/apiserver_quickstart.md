@@ -40,8 +40,23 @@ The most useful flags are:
 - `--port`: bind port, default `8000`
 - `--model-name`: override the model name returned by `/v1/models`
 - `--log-level`: logging level for the server process
+- `--log-level-http`: minimum HTTP access severity, default `warning`
 
 If you already have a pipeline config file, you can also pass `--config path/to/config.yaml`. When the config file contains `model_path`, `--model-path` is optional and can be used as an override.
+
+### Logging
+
+HTTP access logs use the response status: successful requests are INFO, 4xx
+responses are WARNING, and 5xx responses are ERROR. The default
+`--log-level-http warning` keeps failed requests visible without printing every
+successful generation or health check. Use `--log-level-http info` to include
+successful requests during diagnosis.
+
+`--log-level` controls pipeline and stage logging independently. For a quiet
+serving process, use `--log-level warning --log-level-http warning`. For detailed
+diagnosis, use `--log-level debug --log-level-http info`. Pipeline child workers
+inherit the selected process logging level. Tensor weight bucket acknowledgments
+are DEBUG messages; administrative error responses retain their status and body.
 
 ### Unified SGLang CLI
 

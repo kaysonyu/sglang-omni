@@ -68,6 +68,11 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.profiler.event_recorder import emit
+from sglang_omni.profiler.http_events import (
+    RequestProfileMiddleware,
+    current_http_profile_id,
+)
 from sglang_omni.serve.action_scoring import register_action_scoring
 from sglang_omni.serve.generation_params import (
     record_explicit_generation_params as _record_explicit_generation_params,
@@ -93,6 +98,7 @@ from sglang_omni.serve.protocol import (
     GenerateMetaInfo,
     GenerateResponse,
     InitWeightsUpdateGroupRequest,
+    MemoryOccupationRequest,
     ModelCard,
     ModelList,
     PauseGenerationRequest,
@@ -101,6 +107,7 @@ from sglang_omni.serve.protocol import (
     SpeechBatchResponse,
     UpdateWeightFromDiskRequest,
     UpdateWeightsFromDistributedRequest,
+    UpdateWeightsFromTensorRequest,
     UsageResponse,
     VoiceListResponse,
     WeightsCheckerRequest,
@@ -245,6 +252,7 @@ def create_app(
         Configured FastAPI application.
     """
     app = FastAPI(title="sglang-omni", version=__version__)
+    app.add_middleware(RequestProfileMiddleware, stage="frontend_http")
 
     app.add_middleware(
         CORSMiddleware,
@@ -519,19 +527,39 @@ def register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
 
     @app.post("/update_weights_from_tensor", dependencies=[Depends(_auth)])
     async def update_weights_from_tensor(
-        request: Request,
+        req: UpdateWeightsFromTensorRequest,
     ) -> JSONResponse:
-        return JSONResponse(
-            status_code=501,
-            content={
-                "error": {
-                    "message": (
-                        "update_weights_from_tensor is not yet implemented. "
-                        "Use update_weights_from_disk for the disk-based weight update path."
-                    ),
-                    "code": "not_implemented",
-                }
-            },
+        client: Client = app.state.client
+        return admin_response(
+            await client.update_weights_from_tensor(
+                request_payload(req),
+                stages=req.stages,
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
+            )
+        )
+
+    @app.post("/release_memory_occupation", dependencies=[Depends(_auth)])
+    async def release_memory_occupation(req: MemoryOccupationRequest) -> JSONResponse:
+        client: Client = app.state.client
+        return admin_response(
+            await client.admin(
+                "release_memory_occupation",
+                request_payload(req),
+                stages=req.stages,
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
+            )
+        )
+
+    @app.post("/resume_memory_occupation", dependencies=[Depends(_auth)])
+    async def resume_memory_occupation(req: MemoryOccupationRequest) -> JSONResponse:
+        client: Client = app.state.client
+        return admin_response(
+            await client.admin(
+                "resume_memory_occupation",
+                request_payload(req),
+                stages=req.stages,
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
+            )
         )
 
     @app.post("/init_weights_update_group", dependencies=[Depends(_auth)])
@@ -1048,9 +1076,20 @@ def register_generate(app: FastAPI) -> None:
 
         request_id = str(uuid.uuid4())
         audio_format = req.response_format
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_validated",
+            metadata={"http_request_id": current_http_profile_id()},
+        )
 
         try:
             gen_req = build_rollout_generate_request(req)
+            emit(
+                request_id=request_id,
+                stage="frontend",
+                event_name="generate_request_built",
+            )
             result = await client.completion(
                 gen_req,
                 request_id=request_id,
@@ -1068,8 +1107,31 @@ def register_generate(app: FastAPI) -> None:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_completion_ready",
+        )
         response = build_generate_response(req, result, audio_format)
-        return JSONResponse(content=response.model_dump())
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_response_built",
+        )
+        response_payload = response.model_dump()
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_response_dumped",
+        )
+        encoded_response = JSONResponse(content=response_payload)
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_response_encoded",
+            metadata={"bytes": len(encoded_response.body)},
+        )
+        return encoded_response
 
 
 def rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
@@ -1103,12 +1165,20 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
     if req.messages is not None:
         messages = [Message(role=m.role, content=m.content) for m in req.messages]
 
+    stage_params = {
+        name: dict(parameters) for name, parameters in (req.stage_params or {}).items()
+    }
     stage_sampling: dict[str, SamplingParams] | None = None
     if req.stage_sampling:
         stage_sampling = {
             name: rollout_sampling_to_client(params)
             for name, params in req.stage_sampling.items()
         }
+        for name, parameters in req.stage_sampling.items():
+            if parameters.stop_sampling is not None:
+                stage_params.setdefault(name, {}).setdefault(
+                    "stop_sampling", parameters.stop_sampling
+                )
 
     extra_params: dict[str, Any] = {
         "return_logprob": req.return_logprob,
@@ -1121,6 +1191,8 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
         "return_routed_experts": req.return_routed_experts,
         "return_indexer_topk": req.return_indexer_topk,
     }
+    if req.sampling_params.stop_sampling is not None:
+        extra_params["stop_sampling"] = req.sampling_params.stop_sampling
     metadata = dict(req.metadata) if req.metadata else {}
     _record_explicit_generation_params(
         metadata,
@@ -1134,7 +1206,7 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
         messages=messages,
         sampling=sampling,
         stage_sampling=stage_sampling,
-        stage_params=req.stage_params,
+        stage_params=stage_params or None,
         extra_params=extra_params,
         stream=req.stream,
         max_tokens=sampling.max_new_tokens,

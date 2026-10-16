@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 import sys
 import types
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -33,6 +34,7 @@ from sglang_omni.models.moss_tts_local.request_builders import (
     build_generation_kwargs,
     build_moss_tts_local_state,
     clear_moss_tts_local_preprocessing_context,
+    prepare_moss_tts_local_request,
     preprocess_moss_tts_local_payload,
     set_moss_tts_local_preprocessing_context,
 )
@@ -1074,6 +1076,137 @@ def _payload(text: str = "hello") -> StagePayload:
         request=OmniRequest(inputs={"text": text}, params={}, metadata={}),
         data={},
     )
+
+
+@pytest.fixture
+def structured_local_processor() -> Mock:
+    processor = Mock()
+    processor.model_config = types.SimpleNamespace(prompt_protocol="moss_tts_v2")
+    processor.build_user_message.return_value = {"role": "user", "content": "rendered"}
+    processor.return_value = {
+        "input_ids": torch.arange(4 * (N_VQ + 1)).reshape(1, 4, N_VQ + 1)
+    }
+    return processor
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["Hello.", [{"text": "Hello.", "local_instruction": "Speak quietly."}]],
+)
+def test_structured_local_prompt_reaches_checkpoint_processor(
+    structured_local_processor: Mock, script: str | list[dict[str, str]]
+) -> None:
+    payload = _payload()
+    payload.request.inputs = {
+        "script": script,
+        "global_instruction": {"voice": "自然", "pace": "slow"},
+        "references": [
+            {"id": "speaker", "uri": "speaker.wav"},
+            {"id": "style", "uri": "data:audio/wav;base64,YXVkaW8="},
+        ],
+    }
+    payload.request.params = {"tokens": 25}
+    reference_encoder = Mock()
+    speaker_codes = torch.ones(3, N_VQ, dtype=torch.long)
+    style_codes = torch.full((2, N_VQ), 2, dtype=torch.long)
+    reference_encoder.encode.return_value = speaker_codes
+    reference_encoder.encode_data_uri.return_value = style_codes
+
+    prepared = prepare_moss_tts_local_request(
+        payload,
+        processor=structured_local_processor,
+        reference_encoder=reference_encoder,
+    )
+
+    reference_encoder.encode.assert_called_once_with("speaker.wav")
+    reference_encoder.encode_data_uri.assert_called_once_with(
+        "data:audio/wav;base64,YXVkaW8="
+    )
+    kwargs = structured_local_processor.build_user_message.call_args.kwargs
+    assert set(kwargs) == {"script", "reference", "global_instruction", "tokens"}
+    assert kwargs["script"] == script
+    assert kwargs["global_instruction"] == '{"pace":"slow","voice":"自然"}'
+    assert kwargs["tokens"] == 25
+    assert kwargs["reference"][0] is speaker_codes
+    assert kwargs["reference"][1] is style_codes
+    structured_local_processor.assert_called_once_with(
+        [[structured_local_processor.build_user_message.return_value]],
+        mode="generation",
+    )
+    torch.testing.assert_close(
+        prepared.prompt_rows, structured_local_processor.return_value["input_ids"][0]
+    )
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"script": "Hello.", "text": "Legacy text"},
+        {"script": [{"text": "Hello.", "unexpected": "value"}]},
+        {"script": "Hello.", "global_instruction": {"pace": float("nan")}},
+        {"script": "Hello.", "references": [{"audio_path": "speaker.wav"}]},
+        {
+            "script": "Hello.",
+            "references": [
+                {"id": "speaker", "uri": "first.wav"},
+                {"id": "speaker", "uri": "second.wav"},
+            ],
+        },
+    ],
+)
+def test_structured_local_prompt_rejects_invalid_inputs_before_processing(
+    structured_local_processor: Mock, inputs: dict[str, object]
+) -> None:
+    payload = _payload()
+    payload.request.inputs = inputs
+    with pytest.raises(ValueError):
+        prepare_moss_tts_local_request(payload, processor=structured_local_processor)
+    structured_local_processor.build_user_message.assert_not_called()
+    structured_local_processor.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["params", "stage_params", "tts_params"])
+@pytest.mark.parametrize(
+    "legacy_key", ["instructions", "instruct", "ref_audio", "ref_text"]
+)
+def test_structured_local_prompt_rejects_legacy_parameter_mix(
+    structured_local_processor: Mock, source: str, legacy_key: str
+) -> None:
+    payload = _payload()
+    payload.request.inputs = {"script": "Hello."}
+    if source == "tts_params":
+        payload.request.metadata = {"tts_params": {legacy_key: "legacy"}}
+    elif source == "stage_params":
+        payload.request.params = {
+            "stage_params": {"tts_engine": {legacy_key: "legacy"}}
+        }
+    else:
+        payload.request.params = {legacy_key: "legacy"}
+    with pytest.raises(ValueError, match="cannot mix legacy"):
+        prepare_moss_tts_local_request(payload, processor=structured_local_processor)
+    structured_local_processor.build_user_message.assert_not_called()
+
+
+@pytest.mark.parametrize("tts_params", [None, False, 7, "instructions", ["ref_audio"]])
+def test_structured_local_prompt_preserves_nonmapping_metadata_handling(
+    structured_local_processor: Mock, tts_params: object
+) -> None:
+    payload = _payload()
+    payload.request.inputs = {"script": "Hello."}
+    payload.request.metadata = {"tts_params": tts_params}
+
+    prepare_moss_tts_local_request(payload, processor=structured_local_processor)
+
+    structured_local_processor.build_user_message.assert_called_once_with(
+        script="Hello.", reference=None, global_instruction=None, tokens=None
+    )
+
+
+def test_structured_local_prompt_requires_native_processor() -> None:
+    payload = _payload()
+    payload.request.inputs = {"script": "Hello."}
+    with pytest.raises(ValueError, match="require a moss_tts_v2 processor"):
+        prepare_moss_tts_local_request(payload, processor=_FakeProcessor())
 
 
 def test_create_preprocessing_executor_cache_toggles(monkeypatch):
