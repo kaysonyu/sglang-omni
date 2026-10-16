@@ -24,6 +24,7 @@ from sglang_omni.models.moss_tts_prism.scoring import (
     PrismScoreModelRunner,
     PrismScoreRequestData,
     PrismScoreResultAdapter,
+    PrismTeacherWeightChecker,
     build_score_request,
     score_result,
 )
@@ -172,7 +173,9 @@ class PrismScoreEngineBuilder(MossTTSPrismEngineBuilder):
         )
         model = model_worker.model_runner.model
         model.model_identity = prism_model_identity(checkpoint_dir)
-        model.enable_action_scoring = True
+        checker = PrismTeacherWeightChecker(model_worker.model_runner)
+        model_worker._strict_weight_checker = checker
+        model.teacher_weight_sha256 = checker.checksum()["per_gpu_checksum"]
         model.teacher_weight_version = str(get_serving().weight_version)
 
     def make_model_runner(
