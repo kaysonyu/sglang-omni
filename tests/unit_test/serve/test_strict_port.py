@@ -33,3 +33,31 @@ def test_busy_port_hard_errors_under_strict(monkeypatch):
         busy = holder.getsockname()[1]
         with pytest.raises(RuntimeError, match="STRICT_PORT"):
             find_available_port("127.0.0.1", busy)
+
+
+def test_strict_port_reuses_a_closed_listener_in_time_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_STRICT_PORT", "1")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        address = listener.getsockname()
+        with socket.create_connection(address, timeout=1) as client:
+            accepted, _ = listener.accept()
+            accepted.close()
+            assert client.recv(1) == b""
+    assert find_available_port(*address) == address[1]
+
+
+def test_strict_port_still_rejects_a_live_reusable_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_STRICT_PORT", "1")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        with pytest.raises(RuntimeError, match="STRICT_PORT"):
+            find_available_port(*listener.getsockname())

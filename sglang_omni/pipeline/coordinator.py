@@ -127,6 +127,7 @@ class Coordinator(CoordinatorSessions):
         self._abort_tasks: dict[str, asyncio.Task[bool]] = {}
         self._admin_ops: dict[str, AdminPendingOperation] = {}
         self._admin_lock = asyncio.Lock()
+        self.memory_offloaded_stages: set[str] = set()
 
         # State
         self._running = False
@@ -224,6 +225,10 @@ class Coordinator(CoordinatorSessions):
         )
 
         async with self._admin_lock:
+            if action == "release_memory_occupation":
+                if self._requests or self._abort_tasks:
+                    raise ValueError("Memory release requires an idle pipeline")
+                self.memory_offloaded_stages.update(target_stages)
             self._admin_ops[op_id] = pending
             try:
                 for stage_name in target_stages:
@@ -236,6 +241,10 @@ class Coordinator(CoordinatorSessions):
 
                 assert pending.future is not None
                 results = await asyncio.wait_for(pending.future, timeout=timeout_s)
+                if action == "resume_memory_occupation":
+                    for result in results.values():
+                        if result.success and result.data.get("offload_tags") == []:
+                            self.memory_offloaded_stages.discard(result.stage)
             finally:
                 self._admin_ops.pop(op_id, None)
 
@@ -297,6 +306,17 @@ class Coordinator(CoordinatorSessions):
             payload,
             stages=stages,
             timeout_s=timeout_s,
+        )
+
+    async def update_weights_from_tensor(
+        self,
+        payload: dict[str, object],
+        *,
+        stages: Sequence[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, object]:
+        return await self.admin(
+            "update_weights_from_tensor", payload, stages=stages, timeout_s=timeout_s
         )
 
     async def init_weights_update_group(
@@ -424,6 +444,10 @@ class Coordinator(CoordinatorSessions):
         """Submit a request without waiting for completion."""
         if self._fatal_error is not None:
             raise RuntimeError(self._fatal_error)
+        if self.memory_offloaded_stages:
+            raise RuntimeError(
+                "Pipeline memory is released; resume memory before generating"
+            )
         if self.request_id_is_reserved(request_id):
             raise ValueError(f"Request {request_id} already exists")
 
