@@ -17,6 +17,8 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from sglang_omni.profiler.event_recorder import emit
+from sglang_omni.profiler.http_events import current_http_profile_id
 from sglang_omni.serve.speech_errors import openai_error_payload
 from sglang_omni.serve.speech_limits import MAX_VOICE_UPLOAD_BODY_BYTES
 from sglang_omni_router.python.config import Capability, RouterConfig
@@ -549,6 +551,14 @@ class ProxyHandler:
             headers=filter_request_headers(request),
         )
         worker.increment_active()
+        profile_id = current_http_profile_id()
+        if profile_id is not None:
+            emit(
+                request_id=profile_id,
+                stage="router",
+                event_name="router_upstream_start",
+                metadata={"worker_url": worker.url},
+            )
         try:
             upstream = await self._client.send(upstream_request, stream=True)
         except httpx.PoolTimeout:
@@ -607,6 +617,13 @@ class ProxyHandler:
                 self._voice_routing.mark_uncertain()
             raise
 
+        if profile_id is not None:
+            emit(
+                request_id=profile_id,
+                stage="router",
+                event_name="router_upstream_headers",
+                metadata={"status": upstream.status_code},
+            )
         return upstream
 
     async def build_relay_response(

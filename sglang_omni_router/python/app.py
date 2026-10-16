@@ -22,6 +22,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.profiler.http_events import RequestProfileMiddleware
 from sglang_omni_router.python.config import (
     MIN_CONNECTIONS_PER_WORKER,
     RouterConfig,
@@ -195,6 +196,7 @@ def create_app(
     resolved_key = resolve_admin_api_key(admin_api_key)
 
     app = FastAPI(title="sglang-omni-router", version=__version__, lifespan=lifespan)
+    app.add_middleware(RequestProfileMiddleware, stage="router_http", header_only=True)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

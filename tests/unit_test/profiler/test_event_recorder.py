@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
+from starlette.types import Receive, Scope, Send
 
 from sglang_omni.profiler.event_recorder import (
     RequestEvent,
@@ -18,6 +21,99 @@ from sglang_omni.profiler.event_recorder import (
     reset_active_stage,
     set_active_stage,
 )
+from sglang_omni.profiler.http_events import (
+    RequestProfileMiddleware,
+    current_http_profile_id,
+)
+
+
+def test_http_profile_preserves_streamed_bytes_and_isolates_concurrent_requests(
+    tmp_path: Path,
+) -> None:
+    async def application(scope: Scope, receive: Receive, send: Send) -> None:
+        request = await receive()
+        profile_id = current_http_profile_id()
+        assert profile_id is not None
+        await send({"type": "http.response.start", "status": 207, "headers": []})
+        await send(
+            {"type": "http.response.body", "body": request["body"], "more_body": True}
+        )
+        await asyncio.sleep(0)
+        assert current_http_profile_id() == profile_id
+        await send(
+            {
+                "type": "http.response.body",
+                "body": profile_id.encode(),
+                "more_body": False,
+            }
+        )
+
+    async def exercise() -> None:
+        application_with_profile = RequestProfileMiddleware(
+            application, stage="frontend_http"
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(application_with_profile),
+            base_url="http://test",
+        ) as client:
+            responses = await asyncio.gather(
+                *(
+                    client.post(
+                        "/generate",
+                        content=b"payload-",
+                        headers={"x-omni-profile-id": name},
+                    )
+                    for name in ("a", "b")
+                )
+            )
+        assert [response.content for response in responses] == [
+            b"payload-a",
+            b"payload-b",
+        ]
+        assert all(response.status_code == 207 for response in responses)
+        assert current_http_profile_id() is None
+
+    recorder = get_recorder()
+    path = recorder.start("http-test", str(tmp_path), "frontend")
+    asyncio.run(exercise())
+    recorder.stop()
+    events = _read_events(path)
+    for name in ("a", "b"):
+        selected = [event for event in events if event["request_id"] == name]
+        assert selected[0]["event_name"] == "http_received"
+        sent = next(
+            event for event in selected if event["event_name"] == "http_response_sent"
+        )
+        assert sent["metadata"]["bytes"] == 9
+        assert sent["metadata"]["send_wait_ns"] >= 0
+        assert selected[-1]["event_name"] == "http_complete"
+
+
+def test_http_profile_preserves_failure_and_clears_request_context(
+    tmp_path: Path,
+) -> None:
+    async def failing_application(scope: Scope, receive: Receive, send: Send) -> None:
+        assert current_http_profile_id() == "failing-request"
+        raise RuntimeError("backend failed")
+
+    async def exercise() -> None:
+        application = RequestProfileMiddleware(
+            failing_application, stage="router_http", header_only=True
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(application), base_url="http://test"
+        ) as client:
+            with pytest.raises(RuntimeError, match="backend failed"):
+                await client.post(
+                    "/generate", headers={"x-omni-profile-id": "failing-request"}
+                )
+        assert current_http_profile_id() is None
+
+    recorder = get_recorder()
+    path = recorder.start("failed-http", str(tmp_path), "router")
+    asyncio.run(exercise())
+    recorder.stop()
+    assert _read_events(path)[-1]["metadata"]["status"] == 0
 
 
 @pytest.fixture(autouse=True)

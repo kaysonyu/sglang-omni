@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Typed replay contract for frozen Prism teacher scores."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Literal, TypedDict
+
+import numpy as np
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    model_validator,
+)
+from transformers import PretrainedConfig
+
+
+class PrismScoreInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[2] = 2
+    sample_id: str = Field(min_length=1)
+    layout: Literal["moss_prism_typed_v1"]
+    prompt_rows: list[list[StrictInt]] = Field(min_length=1)
+    item_kind: list[Literal[0, 1]]
+    audio_role: list[Literal[0, 1]]
+    successor_audio_mask: list[StrictBool]
+    successor_audio_codes: list[list[StrictInt]]
+    target_history_retention_mask: list[list[StrictBool]]
+    codes: list[list[StrictInt]]
+    finish_reason: Literal["stop", "length"]
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_carrier(self) -> PrismScoreInput:
+        rows = len(self.prompt_rows)
+        channels = len(self.prompt_rows[0]) - 1
+        if channels < 1 or any(len(row) != channels + 1 for row in self.prompt_rows):
+            raise ValueError("prompt_rows must have a consistent text and audio width")
+        for values in (
+            self.item_kind,
+            self.audio_role,
+            self.successor_audio_mask,
+            self.successor_audio_codes,
+            self.target_history_retention_mask,
+        ):
+            if len(values) != rows:
+                raise ValueError("Typed fields must align with prompt_rows")
+        for values in (
+            self.successor_audio_codes,
+            self.target_history_retention_mask,
+            self.codes,
+        ):
+            if any(len(row) != channels for row in values):
+                raise ValueError("Audio fields must contain complete RVQ frames")
+        if not self.codes and self.finish_reason != "stop":
+            raise ValueError("A zero-frame trajectory must end with stop")
+        if self.item_kind != self.audio_role:
+            raise ValueError("The prompt must contain only text and reference audio")
+        return self
+
+    def validate_model(self, config: PretrainedConfig, context_length: int) -> None:
+        if len(self.prompt_rows[0]) != config.n_vq + 1:
+            raise ValueError(f"prompt_rows must have {config.n_vq + 1} channels")
+        text_tokens = [row[0] for row in self.prompt_rows]
+        if (
+            min(text_tokens) < 0
+            or max(text_tokens) >= config.language_config.vocab_size
+        ):
+            raise ValueError("Prompt text token is outside the model vocabulary")
+        try:
+            prompt_rows = np.asarray(self.prompt_rows, dtype=np.int64)
+            successors = np.asarray(self.successor_audio_codes, dtype=np.int64)
+            codes = np.asarray(self.codes, dtype=np.int64)
+        except OverflowError as error:
+            raise ValueError("Audio code is outside the model vocabulary") from error
+        for values in (prompt_rows[:, 1:], successors, codes):
+            if np.any(values < 0) or np.any(values >= config.speech_vocab_size):
+                raise ValueError("Audio code is outside the model vocabulary")
+        last = self.prompt_rows[-1]
+        if (
+            last[0] != config.audio_start_token_id
+            or any(last[1:])
+            or self.item_kind[-1]
+            or self.successor_audio_mask[-1]
+            or any(self.successor_audio_codes[-1])
+        ):
+            raise ValueError("Prompt must end in an unconditioned target audio_start")
+        audio = np.asarray(self.item_kind, dtype=np.bool_)
+        if np.any(prompt_rows[audio, 0] != config.text_pad_idx) or np.any(
+            prompt_rows[~audio, 1:]
+        ):
+            raise ValueError("Prompt rows disagree with their item_kind")
+        has_successor = np.zeros(len(prompt_rows), dtype=np.bool_)
+        has_successor[:-1] = audio[1:]
+        expected = np.zeros_like(successors)
+        expected[:-1] = np.where(audio[1:, None], prompt_rows[1:, 1:], 0)
+        if not np.array_equal(
+            self.successor_audio_mask, has_successor
+        ) or not np.array_equal(successors, expected):
+            raise ValueError("Reference successor edges disagree with prompt_rows")
+        if np.any(
+            prompt_rows[has_successor & ~audio, 0] != config.audio_start_token_id
+        ):
+            raise ValueError("Reference audio must follow an audio_start anchor")
+        if len(self.prompt_rows) + self.prediction_count - 1 > context_length:
+            raise ValueError(
+                f"Score input exceeds the model context of {context_length} rows"
+            )
+
+    @property
+    def prediction_count(self) -> int:
+        return len(self.codes) + int(self.finish_reason == "stop")
+
+    def input_sha256(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(exclude={"sample_id"}),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+
+class PrismScoreBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    samples: list[PrismScoreInput] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def unique_ids(self) -> PrismScoreBatch:
+        if len({sample.sample_id for sample in self.samples}) != len(self.samples):
+            raise ValueError("sample_id must be unique within a score request")
+        return self
+
+
+class PrismScoreResult(TypedDict):
+    version: Literal[2]
+    sample_id: str
+    input_sha256: str
+    code_logprobs: list[list[float]]
+    selected_stop_logprobs: list[float]
+    finish_reason: str
+    temperature: float
+    weight_version: str
+    logprob_semantics: str
+    stop_semantics: str
+    model_identity: dict[str, str | int | bool]

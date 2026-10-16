@@ -339,3 +339,82 @@ def test_model_worker_update_weights_from_distributed_rejects_mismatched_metadat
     assert success is False
     assert "same length" in message
     assert calls == 0
+
+
+def test_model_info_without_rollout_extension_keeps_default_capabilities() -> None:
+    worker = object.__new__(ModelWorker)
+    worker.model_runner = SimpleNamespace(model=object())
+    worker.tp_rank = 0
+    worker.model_arch_override = None
+    worker.prefill_cuda_graph_info = lambda: {"backend": "disabled"}
+    with get_context().override_server_args(
+        model_path="test-model", load_format="auto", weight_version="v1", tp_size=1
+    ):
+        info = worker.model_info()
+    assert info["weight_version"] == "v1"
+    assert info["supports_weight_update"] and info["supports_weight_checker"]
+    assert "rollout_schema_versions" not in info
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_tensor_update_deserializes_only_own_rank_and_synchronizes(
+    monkeypatch, success
+):
+    from sglang.srt.utils import MultiprocessingSerializer, patch_torch
+
+    events = []
+
+    def deserialize(handle):
+        events.append(("deserialize", handle))
+        return [("weight", torch.ones(2))]
+
+    def update(named_tensors, load_format):
+        events.append(("copy", named_tensors[0][0], load_format))
+        return success, "result"
+
+    monkeypatch.setattr(patch_torch, "monkey_patch_torch_reductions", lambda: None)
+    monkeypatch.setattr(MultiprocessingSerializer, "deserialize", deserialize)
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(synchronize=lambda: events.append("sync")),
+    )
+    with get_context().override_server_args(
+        tp_size=2, weight_version="old"
+    ) as published:
+        worker = object.__new__(ModelWorker)
+        worker.tp_rank = 1
+        worker.server_args = published
+        worker.model_runner = SimpleNamespace(
+            update_weights_from_tensor=update, device="cuda"
+        )
+        assert worker.update_weights_from_tensor(
+            {
+                "serialized_named_tensors": ["rank-0", "rank-1"],
+                "load_format": "flattened_bucket",
+                "weight_version": "new",
+            }
+        ) == (success, "result")
+        assert events == [
+            ("deserialize", "rank-1"),
+            ("copy", "weight", "flattened_bucket"),
+            "sync",
+        ]
+        assert get_serving().weight_version == ("new" if success else "old")
+
+
+def test_tensor_update_rejects_rank_count_before_deserialization(monkeypatch):
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    monkeypatch.setattr(
+        MultiprocessingSerializer,
+        "deserialize",
+        lambda value: pytest.fail("invalid handles must not be opened"),
+    )
+    with get_context().override_server_args(tp_size=2):
+        worker = object.__new__(ModelWorker)
+        worker.tp_rank = 0
+        success, message = worker.update_weights_from_tensor(
+            {"serialized_named_tensors": ["one"]}
+        )
+        assert not success and "TP rank" in message

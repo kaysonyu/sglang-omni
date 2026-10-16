@@ -83,3 +83,19 @@ def test_thinker_pool_keeps_the_thinker_layers() -> None:
     ModelWorker.apply_arch_override(config, "Qwen3OmniThinkerForCausalLM")
     assert _pool_layers(config) == 48
     assert config.num_key_value_heads == 4
+
+
+def test_prism_pool_counts_virtual_attention_calls_without_mlp_only_layers() -> None:
+    config = _qwen3_omni_engine_config()
+    config.hf_config.language_config = config.hf_config.talker_config.text_config
+    config.hf_config.prism_mlp_only_layers = (1,)
+    config.hf_config.prism_topology = SimpleNamespace(
+        execution_units=[
+            SimpleNamespace(layer_start=0, layer_stop=2),
+            SimpleNamespace(layer_start=0, layer_stop=2),
+        ]
+    )
+    ModelWorker.apply_arch_override(config, "MossTTSPrismSGLangModel")
+    assert _pool_layers(config) == 2
+    assert config.hf_config.language_config.num_hidden_layers == 20
+    assert config.head_dim == 128

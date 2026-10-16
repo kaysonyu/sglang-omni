@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import typer
@@ -56,6 +57,23 @@ def _serve_kwargs(**overrides):
     )
     data.update(overrides)
     return data
+
+
+@patch("sglang_omni.cli.serve.launch_server")
+@patch("sglang_omni.cli.serve.ConfigManager.from_model_path")
+@pytest.mark.parametrize("http_level", ["warning", "info"])
+def test_cli_forwards_independent_http_log_level(
+    from_model_path: MagicMock,
+    launch_server: MagicMock,
+    http_level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from_model_path.return_value = _DummyManager()
+    with caplog.at_level(logging.INFO):
+        serve(**_serve_kwargs(log_level="warning", log_level_http=http_level))
+        assert logging.getLogger().level == logging.WARNING
+    assert launch_server.call_args.kwargs["log_level"] == "warning"
+    assert launch_server.call_args.kwargs["log_level_http"] == http_level
 
 
 def _stage(config, name: str):

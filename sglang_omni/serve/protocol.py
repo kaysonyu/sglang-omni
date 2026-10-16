@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
+from sglang_omni.model_runner.weight_publication import WeightPublicationPart
+
 
 class UsageResponse(BaseModel):
     """Token usage statistics."""
@@ -162,6 +164,7 @@ class RolloutSamplingParams(BaseModel):
     stop: str | list[str] | None = None
     stop_token_ids: list[int] | None = None
     seed: int | None = None
+    stop_sampling: bool | None = Field(default=None, strict=True)
     max_new_tokens: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
 
@@ -230,7 +233,7 @@ class RolloutGenerateRequest(BaseModel):
     model: str | None = None
 
     input_ids: list[int] | None = None
-    prompt: str | None = None
+    prompt: str | dict[str, Any] | None = None
     messages: list[RolloutMessage] | None = None
 
     sampling_params: RolloutSamplingParams = Field(
@@ -247,6 +250,8 @@ class RolloutGenerateRequest(BaseModel):
 
     return_logprob: bool = True
     return_omni_rollout: bool = False
+    return_audio: bool = Field(default=True, strict=True)
+    response_format: Literal["wav", "flac"] = "wav"
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
 
@@ -628,13 +633,19 @@ class UpdateWeightFromDiskRequest(AdminRequestBase):
 
 
 class UpdateWeightsFromTensorRequest(AdminRequestBase):
-    serialized_named_tensors: list[Any] | None = None
+    serialized_named_tensors: list[str] = Field(min_length=1)
     load_format: str | None = None
     flush_cache: bool = True
     abort_all_requests: bool = False
     weight_version: str | None = None
     disable_draft_model: bool | None = None
     torch_empty_cache: bool = False
+    keep_pause: bool = False
+    publication: WeightPublicationPart | None = None
+
+
+class MemoryOccupationRequest(AdminRequestBase):
+    tags: list[Literal["weights", "kv_cache", "cuda_graph"]] | None = None
 
 
 class UpdateWeightsFromDistributedRequest(AdminRequestBase):
@@ -647,6 +658,7 @@ class UpdateWeightsFromDistributedRequest(AdminRequestBase):
     weight_version: str | None = None
     load_format: str | None = None
     torch_empty_cache: bool = False
+    keep_pause: bool = False
 
 
 class InitWeightsUpdateGroupRequest(AdminRequestBase):

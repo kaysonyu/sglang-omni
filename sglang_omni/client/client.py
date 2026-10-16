@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from contextlib import aclosing
 from dataclasses import replace
@@ -31,6 +32,7 @@ from sglang_omni.client.types import (
     UsageInfo,
 )
 from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.profiler.event_recorder import emit
 from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
 
 
@@ -69,7 +71,10 @@ class Client:
             return
 
         result = await self._coordinator.submit(req_id, omni_request)
-        yield self._result_builder(req_id, result)
+        emit(request_id=req_id, stage="client", event_name="client_result_build_start")
+        result_chunk = self._result_builder(req_id, result)
+        emit(request_id=req_id, stage="client", event_name="client_result_build_end")
+        yield result_chunk
 
     # ------------------------------------------------------------------
     # High-level: non-streaming completion
@@ -128,6 +133,11 @@ class Client:
 
         audio: CompletionAudio | None = None
         if audio_chunks:
+            emit(
+                request_id=request_id,
+                stage="client",
+                event_name="client_audio_encode_start",
+            )
             if len(audio_chunks) == 1:
                 combined = audio_chunks[0]
             else:
@@ -143,9 +153,20 @@ class Client:
                 id=f"audio-{request_id}",
                 data=audio_b64,
                 transcript=full_text if full_text else None,
+                sample_rate=sample_rate or DEFAULT_SAMPLE_RATE,
+            )
+            emit(
+                request_id=request_id,
+                stage="client",
+                event_name="client_audio_encode_end",
             )
 
-        return CompletionResult(
+        emit(
+            request_id=request_id,
+            stage="client",
+            event_name="client_completion_build_start",
+        )
+        completion = CompletionResult(
             request_id=request_id,
             text=full_text,
             audio=audio,
@@ -158,6 +179,12 @@ class Client:
             weight_version=weight_version,
             language=language,
         )
+        emit(
+            request_id=request_id,
+            stage="client",
+            event_name="client_completion_build_end",
+        )
+        return completion
 
     # ------------------------------------------------------------------
     # High-level: streaming completion
@@ -361,6 +388,17 @@ class Client:
             timeout_s=timeout_s,
         )
 
+    async def update_weights_from_tensor(
+        self,
+        payload: dict[str, object],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, object]:
+        return await self._coordinator.update_weights_from_tensor(
+            payload, stages=stages, timeout_s=timeout_s
+        )
+
     async def init_weights_update_group(
         self,
         payload: dict[str, Any],
@@ -468,6 +506,13 @@ class Client:
         return OmniRequest(inputs=inputs, params=params, metadata=metadata)
 
     @staticmethod
+    def decode_omni_rollout(value: bytes | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value, bytes):
+            return json.loads(value)
+        else:
+            return value
+
+    @staticmethod
     def default_result_builder(request_id: str, result: Any) -> GenerateChunk:
         chunk = GenerateChunk(request_id=request_id, finish_reason="stop")
         if isinstance(result, GenerateChunk):
@@ -495,7 +540,7 @@ class Client:
                     chunk.output_token_logprobs = output_token_logprobs
                 omni_rollout = decode_result.get("omni_rollout")
                 if omni_rollout is not None:
-                    chunk.omni_rollout = omni_rollout
+                    chunk.omni_rollout = Client.decode_omni_rollout(omni_rollout)
                 weight_version = decode_result.get("weight_version")
                 if weight_version is not None:
                     chunk.weight_version = weight_version
@@ -520,7 +565,7 @@ class Client:
                 chunk.output_token_logprobs = output_token_logprobs
             omni_rollout = result.get("omni_rollout")
             if omni_rollout is not None:
-                chunk.omni_rollout = omni_rollout
+                chunk.omni_rollout = Client.decode_omni_rollout(omni_rollout)
             weight_version = result.get("weight_version")
             if weight_version is not None:
                 chunk.weight_version = weight_version
@@ -579,7 +624,7 @@ class Client:
                 chunk.output_token_logprobs = output_token_logprobs
             omni_rollout = data.get("omni_rollout")
             if omni_rollout is not None:
-                chunk.omni_rollout = omni_rollout
+                chunk.omni_rollout = Client.decode_omni_rollout(omni_rollout)
             weight_version = data.get("weight_version")
             if weight_version is not None:
                 chunk.weight_version = weight_version

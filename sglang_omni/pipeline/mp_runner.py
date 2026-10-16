@@ -145,9 +145,15 @@ def build_stage_groups(
         # must construct anyway.
         base_factory_kwargs = resolve_stage_factory_kwargs(stage_cfg, config)
         typed_kwargs = resolve_stage_typed_kwargs(stage_cfg)
+        if config.enable_memory_saver and stage_cfg.engine is not None:
+            typed_kwargs.setdefault("server_args_overrides", {})[
+                "enable_memory_saver"
+            ] = True
 
         stage_kwargs = dict(
             stage_name=stage_cfg.name,
+            enable_memory_saver=config.enable_memory_saver,
+            engine_stage=stage_cfg.engine is not None,
             factory=stage_cfg.factory_path,
             next_stages=stage_cfg.next,
             route_fn=stage_cfg.route_fn,

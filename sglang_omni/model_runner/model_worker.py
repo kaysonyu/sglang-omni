@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import (
     needs_quant_config_normalization,
@@ -56,6 +58,7 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
+    "MossTTSPrismSGLangModel": ("language_config", None),
     "MossTranscribeDiarizeForConditionalGeneration": ("text_config", None),
 }
 
@@ -187,6 +190,17 @@ class ModelWorker:
         # note(ratish): SGLang sizes the KV pool from the larger of these two
         # and set the second from the root text config at construction.
         model_config.num_attention_layers = text_cfg.num_hidden_layers
+        if arch == "MossTTSPrismSGLangModel":
+            from sglang_omni.models.moss_tts_prism.sglang_model import (
+                prism_cache_layout,
+            )
+
+            cache_layers = len(prism_cache_layout(model_config.hf_config))
+            model_config.num_hidden_layers = cache_layers
+            model_config.num_attention_layers = cache_layers
+            model_config.head_dim = int(text_cfg.head_dim)
+            model_config.v_head_dim = model_config.head_dim
+            model_config.vocab_size = int(text_cfg.vocab_size)
         if arch == "MingTTSSGLangModel":
             model_config.head_dim = int(text_cfg.head_dim)
             model_config.v_head_dim = model_config.head_dim
@@ -390,7 +404,7 @@ class ModelWorker:
     def model_info(self) -> dict[str, Any]:
         from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 
-        return {
+        info = {
             "model_path": get_model().model_path,
             "load_format": get_model().load_format,
             "weight_version": get_serving().weight_version,
@@ -401,6 +415,10 @@ class ModelWorker:
             "supports_weight_checker": True,
             "prefill_cuda_graph": self.prefill_cuda_graph_info(),
         }
+        describe = getattr(self.model_runner.model, "rollout_model_info", None)
+        if describe is not None:
+            info.update(describe())
+        return info
 
     def update_weights_from_disk(self, payload: dict[str, Any]) -> tuple[bool, str]:
         model_path = payload.get("model_path")
@@ -427,13 +445,41 @@ class ModelWorker:
         return bool(success), str(message)
 
     def update_weights_from_tensor(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        if payload.get("serialized_named_tensors") is not None:
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.utils import MultiprocessingSerializer
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+        serialized = payload.get("serialized_named_tensors")
+        if (
+            not isinstance(serialized, list)
+            or len(serialized) != get_parallel().tp_size
+        ):
             return (
                 False,
-                "update_weights_from_tensor requires a tensor data plane; "
-                "Omni admin control plane only carries metadata",
+                "serialized_named_tensors must contain one payload per TP rank",
             )
-        return self.call_optional_weight_method("update_weights_from_tensor", payload)
+        if any(not isinstance(value, str) or not value for value in serialized):
+            return False, "serialized_named_tensors must contain non-empty strings"
+        monkey_patch_torch_reductions()
+        tensors = MultiprocessingSerializer.deserialize(serialized[self.tp_rank])
+        try:
+            success, message = self.model_runner.update_weights_from_tensor(
+                named_tensors=tensors, load_format=payload.get("load_format")
+            )
+        finally:
+            # note (Codex): The producer may free its IPC bucket as soon as this call returns.
+            torch.get_device_module(self.model_runner.device).synchronize()
+        if success and payload.get("weight_version") is not None:
+            override_server_args(
+                self.server_args,
+                "sglang-omni-weight-update-tensor",
+                weight_version=payload["weight_version"],
+            )
+        if success:
+            logger.debug(
+                f"Tensor weight update completed tp_rank={self.tp_rank} version={payload.get('weight_version')} format={payload.get('load_format')}"
+            )
+        return bool(success), str(message)
 
     def init_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
         init = self.model_runner.init_weights_update_group
