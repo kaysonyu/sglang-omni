@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -77,18 +78,19 @@ def test_speech_surfaces_finish_reason() -> None:
     assert result.mime_type == "audio/pcm"
 
 
-def test_completion_surfaces_omni_rollout() -> None:
+@pytest.mark.parametrize("encoded", [False, True])
+def test_completion_surfaces_omni_rollout(encoded: bool) -> None:
     rollout = {
         "version": 1,
         "model_family": "qwen3_omni",
         "stages": ["talker"],
         "total_action_count": 1,
-        "action_streams": [],
+        "action_streams": [{"actions": [1023], "logprobs": [-0.123456789]}],
     }
     result = {
         "text": "hello",
         "finish_reason": "stop",
-        "omni_rollout": rollout,
+        "omni_rollout": json.dumps(rollout).encode() if encoded else rollout,
     }
     client = Client(_SubmitStubCoordinator(result))
 
@@ -227,3 +229,28 @@ def test_extract_inputs_passes_pretokenized_multimodal_train_inputs() -> None:
         "input_ids": [1, 2, 3],
         "multimodal_train_inputs": bundle,
     }
+
+
+def test_audio_completion_preserves_sample_rate_in_generate_response():
+    from sglang_omni.serve.openai_api import build_generate_response
+    from sglang_omni.serve.protocol import RolloutGenerateRequest
+
+    client = Client(
+        _SubmitStubCoordinator(
+            {
+                "audio_data": [0.0, 0.1, -0.1],
+                "sample_rate": 48000,
+                "finish_reason": "stop",
+            }
+        )
+    )
+    result = asyncio.run(
+        client.completion(
+            GenerateRequest(prompt="hello", stream=False), request_id="audio"
+        )
+    )
+    assert result.audio.sample_rate == 48000
+    response = build_generate_response(
+        RolloutGenerateRequest(prompt="hello", return_logprob=False), result, "wav"
+    )
+    assert response.audio.sample_rate == 48000

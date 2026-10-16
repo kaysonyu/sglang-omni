@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from contextlib import aclosing
 from dataclasses import replace
@@ -143,6 +144,7 @@ class Client:
                 id=f"audio-{request_id}",
                 data=audio_b64,
                 transcript=full_text if full_text else None,
+                sample_rate=sample_rate or DEFAULT_SAMPLE_RATE,
             )
 
         return CompletionResult(
@@ -468,6 +470,13 @@ class Client:
         return OmniRequest(inputs=inputs, params=params, metadata=metadata)
 
     @staticmethod
+    def decode_omni_rollout(value: bytes | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value, bytes):
+            return json.loads(value)
+        else:
+            return value
+
+    @staticmethod
     def default_result_builder(request_id: str, result: Any) -> GenerateChunk:
         chunk = GenerateChunk(request_id=request_id, finish_reason="stop")
         if isinstance(result, GenerateChunk):
@@ -495,7 +504,7 @@ class Client:
                     chunk.output_token_logprobs = output_token_logprobs
                 omni_rollout = decode_result.get("omni_rollout")
                 if omni_rollout is not None:
-                    chunk.omni_rollout = omni_rollout
+                    chunk.omni_rollout = Client.decode_omni_rollout(omni_rollout)
                 weight_version = decode_result.get("weight_version")
                 if weight_version is not None:
                     chunk.weight_version = weight_version
@@ -520,7 +529,7 @@ class Client:
                 chunk.output_token_logprobs = output_token_logprobs
             omni_rollout = result.get("omni_rollout")
             if omni_rollout is not None:
-                chunk.omni_rollout = omni_rollout
+                chunk.omni_rollout = Client.decode_omni_rollout(omni_rollout)
             weight_version = result.get("weight_version")
             if weight_version is not None:
                 chunk.weight_version = weight_version
@@ -579,7 +588,7 @@ class Client:
                 chunk.output_token_logprobs = output_token_logprobs
             omni_rollout = data.get("omni_rollout")
             if omni_rollout is not None:
-                chunk.omni_rollout = omni_rollout
+                chunk.omni_rollout = Client.decode_omni_rollout(omni_rollout)
             weight_version = data.get("weight_version")
             if weight_version is not None:
                 chunk.weight_version = weight_version

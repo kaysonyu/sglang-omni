@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Single-GPU MOSS-TTS Prism pipeline configuration."""
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+from pydantic import Field
+
+from sglang_omni.config import (
+    EngineArgs,
+    EngineStageConfig,
+    FactoryArgs,
+    PipelineConfig,
+    StageConfig,
+)
+
+PKG = "sglang_omni.models.moss_tts_prism"
+
+
+def stages() -> list[StageConfig]:
+    return [
+        StageConfig(
+            name="preprocessing",
+            process="pipeline",
+            gpu=0,
+            factory_path=f"{PKG}.stages.create_preprocessing_executor",
+            gpu_memory_fraction=0.15,
+            next="tts_engine",
+        ),
+        EngineStageConfig(
+            name="tts_engine",
+            process="pipeline",
+            gpu=0,
+            factory_path=f"{PKG}.stages.create_sglang_tts_engine_executor",
+            engine=EngineArgs(
+                disable_cuda_graph=False,
+                cuda_graph_backend_prefill="breakable",
+                cuda_graph_bs_prefill=[64, 128, 256, 384, 512, 768, 1024, 1536, 2048],
+            ),
+            gpu_memory_fraction=0.67,
+            next="vocoder",
+            stream_to=["vocoder"],
+        ),
+        StageConfig(
+            name="vocoder",
+            process="vocoder",
+            gpu=0,
+            factory_path=f"{PKG}.stages.create_vocoder_executor",
+            factory=FactoryArgs(),
+            gpu_memory_fraction=0.18,
+            terminal=True,
+            can_accept_stream_before_payload=True,
+        ),
+    ]
+
+
+class MossTTSPrismPipelineConfig(PipelineConfig):
+    architecture: ClassVar[str] = "MossTTSPrismModel"
+    requires_model_capabilities: ClassVar[bool] = True
+    max_speech_input_chars: ClassVar[int | None] = None
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "tts_engine": EngineStageConfig
+    }
+    stages: list[StageConfig] = Field(default_factory=stages)
+    enable_rl: bool = False
+    vocoder_cuda_graph: bool | None = None
+    codec_model_path: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2"
+    env_defaults: dict[str, str] = Field(
+        default_factory=lambda: {"OMP_NUM_THREADS": "4"}
+    )
+
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, str | bool | None]:
+        if stage_name == "tts_engine" and self.enable_rl:
+            return {"enable_rl": True}
+        if stage_name == "vocoder":
+            return {
+                "codec_model_path": self.codec_model_path,
+                "vocoder_cuda_graph": self.vocoder_cuda_graph,
+            }
+        if stage_name == "preprocessing":
+            return {"codec_model_path": self.codec_model_path}
+        return {}
+
+    def supports_uploaded_voice_references(self) -> bool:
+        return True
+
+
+class MossTTSPrismScorePipelineConfig(PipelineConfig):
+    """Frozen teacher scoring without reference encoding or audio synthesis."""
+
+    architecture: ClassVar[str] = "MossTTSPrismModel"
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "tts_engine": EngineStageConfig
+    }
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: [
+            EngineStageConfig(
+                name="tts_engine",
+                process="teacher",
+                gpu=0,
+                gpu_memory_fraction=0.5,
+                terminal=True,
+                factory_path=f"{PKG}.engine_builder.create_score_engine",
+                factory=FactoryArgs(dtype="bfloat16", score_chunk_size=128),
+                engine=EngineArgs(
+                    disable_cuda_graph=True,
+                    disable_radix_cache=True,
+                    chunked_prefill_size=-1,
+                ),
+            )
+        ]
+    )
+
+
+EntryClass = MossTTSPrismPipelineConfig
+
+Variants = {
+    "default": MossTTSPrismPipelineConfig,
+    "score": MossTTSPrismScorePipelineConfig,
+}

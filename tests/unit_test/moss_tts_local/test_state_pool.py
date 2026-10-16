@@ -514,7 +514,8 @@ def test_collect_frame_reads_generation_steps_from_pool():
     assert int(pool.sampling_steps[row]) == 5
 
 
-def test_sync_execute_commits_sampling_position_before_next_frame(monkeypatch):
+@pytest.mark.parametrize("rollout", [False, True])
+def test_sync_execute_commits_sampling_position_before_next_frame(monkeypatch, rollout):
     monkeypatch.setattr(
         "sglang_omni.model_runner.base.current_platform.get_device",
         lambda gpu_id: torch.device("cpu"),
@@ -522,6 +523,7 @@ def test_sync_execute_commits_sampling_position_before_next_frame(monkeypatch):
     model = _model(max_running_requests=1)
     model.device = torch.device("cpu")
     model.dtype = torch.bfloat16
+    model.enable_rl = rollout
     model.frame_graph_max_bs = 1
     model.config.audio_assistant_slot_token_id = 151646
     model.config.audio_end_token_id = 151670
@@ -531,6 +533,10 @@ def test_sync_execute_commits_sampling_position_before_next_frame(monkeypatch):
     data.req = SimpleNamespace(inflight_middle_chunks=0)
     data.generation_steps = 0
     data.output_rows = []
+    data.return_omni_rollout = rollout
+    data.output_decisions = []
+    data.output_decision_logprobs = []
+    data.output_code_logprobs = []
     data.prompt_rows = torch.zeros((1, 13), dtype=torch.int64)
     request = SimpleNamespace(request_id="rid", data=data)
     positions = []
@@ -541,11 +547,14 @@ def test_sync_execute_commits_sampling_position_before_next_frame(monkeypatch):
         assert int(pool.generation_steps[row]) == data.generation_steps
         assert torch.equal(kwargs["seeds"], torch.tensor([7]))
         positions.append(kwargs["base_positions"].clone())
-        return (
+        outputs = (
             torch.zeros(1, dtype=torch.long),
             torch.full((1, 12), 7, dtype=torch.long),
             torch.ones((1, _HIDDEN), dtype=torch.bfloat16),
         )
+        if rollout:
+            return (*outputs, torch.full((1,), -0.5), torch.full((1, 12), -1.0))
+        return outputs
 
     model.decode_frame_graphed = decode_frame_graphed
     model.prepare_multi_modal_inputs = lambda rows: torch.zeros(
@@ -594,6 +603,10 @@ def test_sync_execute_commits_sampling_position_before_next_frame(monkeypatch):
         assert int(pool.generation_steps[row]) == step + 1
         assert int(pool.sampling_steps[row]) == step + 1
         assert len(data.output_rows) == step + 1
+        if rollout:
+            assert len(data.output_decisions) == step + 1
+            assert len(data.output_decision_logprobs) == step + 1
+            assert len(data.output_code_logprobs) == step + 1
 
     assert torch.equal(torch.cat(positions), torch.tensor([0, 13, 26, 39]))
 
@@ -1371,3 +1384,61 @@ def test_result_adapter_releases_row_after_empty_generation():
         result_adapter(data)
 
     assert reset_calls == ["rid"]
+
+
+def test_rollout_journal_survives_lookahead_and_retains_stop():
+    model = _model(max_running_requests=1)
+    model.enable_rl = True
+    model.device = torch.device("cpu")
+    model.frame_graph_max_bs = 1
+    model.config.audio_assistant_slot_token_id = 151656
+    model.config.audio_end_token_id = 151670
+    model._state_pool = MossTTSLocalDecodeStatePool(model)
+    stop = torch.ones(1, dtype=torch.long)
+    decision_probs = torch.zeros(1)
+    code_probs = torch.zeros(1, 12)
+
+    def decode_frame_graphed(hidden_states, **kwargs):
+        decision_probs.sub_(1)
+        code_probs.sub_(1)
+        return (
+            stop,
+            torch.ones(1, 12, dtype=torch.long),
+            torch.zeros(1, _HIDDEN),
+            decision_probs,
+            code_probs,
+        )
+
+    model.decode_frame_graphed = decode_frame_graphed
+    runner = object.__new__(MossTTSLocalModelRunner)
+    runner.model = model
+    runner._async_enabled = True
+    data = _params()
+    data.req = SimpleNamespace(inflight_middle_chunks=0)
+    data.generation_steps = 0
+    data.return_omni_rollout = True
+    data.output_rows = []
+    data.output_decisions = []
+    data.output_decision_logprobs = []
+    data.output_code_logprobs = []
+    data.stream_metadata = None
+    request = SimpleNamespace(request_id="rid", data=data)
+    first = SimpleNamespace(
+        logits_output=SimpleNamespace(hidden_states=torch.zeros(1, _HIDDEN))
+    )
+    second = SimpleNamespace(
+        logits_output=SimpleNamespace(hidden_states=torch.zeros(1, _HIDDEN))
+    )
+    runner.post_decode_launch(first, SimpleNamespace(), [request])
+    stop.zero_()
+    runner.post_decode_launch(second, SimpleNamespace(), [request])
+    assert torch.equal(first.moss_journal.decisions, torch.ones(1, dtype=torch.long))
+    assert torch.equal(first.moss_journal.decision_logprobs, torch.tensor([-1.0]))
+    assert torch.equal(first.moss_journal.code_logprobs, torch.full((1, 12), -1.0))
+    batch = SimpleNamespace(requests=[request])
+    runner.post_process_outputs(first, batch, {"rid": SimpleNamespace(data=151670)})
+    assert len(data.output_decisions) == 1
+    assert not data.output_rows and not data.output_code_logprobs
+    data.req.is_retracted = True
+    runner.post_process_outputs(second, batch, {"rid": SimpleNamespace(data=0)})
+    assert len(data.output_decisions) == 1

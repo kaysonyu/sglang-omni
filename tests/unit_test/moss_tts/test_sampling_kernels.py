@@ -537,3 +537,45 @@ def test_tied_two_token_head_agrees_across_sampling_paths() -> None:
         assert int(fused.item()) == 0
         assert torch.equal(fused, branchless), f"branchless seed={seed}"
         assert torch.equal(fused, eager), f"eager seed={seed}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("batch_size", [1, 8, 16, 32])
+@pytest.mark.parametrize("vocab_size", [1000, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_full_vocab_sampling_records_scores_without_changing_actions(
+    batch_size, vocab_size, dtype
+):
+    from sglang_omni.models.moss_tts.sampling_kernels import sample_seeded_fused
+
+    generator = torch.Generator(device="cuda").manual_seed(92)
+    logits = torch.randn(
+        batch_size, vocab_size, device="cuda", dtype=dtype, generator=generator
+    )
+    storage = torch.full((batch_size, 24), 123.0, device="cuda")
+    params = {
+        "temperature": torch.tensor([0.7, 1.0, 1.7, 2.3], device="cuda").repeat(
+            (batch_size + 3) // 4
+        )[:batch_size],
+        "top_p": torch.ones(batch_size, device="cuda"),
+        "top_k": torch.full((batch_size,), -1, device="cuda", dtype=torch.long),
+        "seeds": torch.arange(batch_size, device="cuda", dtype=torch.long) + 42,
+        "positions": torch.arange(batch_size, device="cuda", dtype=torch.long) * 24,
+    }
+    for step in range(8):
+        params["positions"].add_(24)
+        expected_actions = sample_seeded_fused(logits, **params)
+        actual = sample_seeded_fused(
+            logits, full_vocab_logprobs=storage[:, 11], **params
+        )
+        torch.testing.assert_close(actual, expected_actions, rtol=0, atol=0)
+        expected_scores = (
+            (logits.float() / params["temperature"][:, None])
+            .log_softmax(-1)
+            .gather(1, actual[:, None])
+            .squeeze(1)
+        )
+        torch.testing.assert_close(
+            storage[:, 11], expected_scores, rtol=1e-5, atol=2e-6
+        )
+        assert torch.all(storage[:, :11] == 123) and torch.all(storage[:, 12:] == 123)

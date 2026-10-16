@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,7 +27,10 @@ from sglang_omni.models.moss_tts.request_builders import (
     validate_moss_tts_generation_kwargs,
 )
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.proto import StagePayload
+from sglang_omni.models.moss_tts_local.rollout_trace import (
+    build_moss_tts_local_rollout_trace,
+)
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY, StagePayload
 from sglang_omni.scheduling.prepared_request_queue import PreparedRequestQueue
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.scheduling.types import ARRequestData
@@ -73,6 +77,11 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     stream_metadata: dict[str, Any] | None = None
     stream_pending_rows: list[torch.Tensor] = field(default_factory=list)
     stream_first_batch_sent: bool = False
+    return_omni_rollout: bool = False
+    admission_weight_version: str | None = None
+    output_decisions: list[torch.Tensor] = field(default_factory=list)
+    output_decision_logprobs: list[torch.Tensor] = field(default_factory=list)
+    output_code_logprobs: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -133,11 +142,17 @@ def pop_prepared_moss_tts_local_request(
 
 def build_moss_tts_local_state(payload: StagePayload) -> MossTTSLocalState:
     inputs = payload.request.inputs or {}
-    params = payload.request.params or {}
+    params = dict(payload.request.params or {})
+    params.update((params.get("stage_params") or {}).get("tts_engine") or {})
     metadata = payload.request.metadata or {}
     tts_params = metadata.get("tts_params")
     if not isinstance(tts_params, dict):
         tts_params = {}
+    else:
+        tts_params = dict(tts_params)
+    explicit = metadata.get(EXPLICIT_GENERATION_PARAMS_KEY)
+    if explicit is not None:
+        tts_params["explicit_generation_params"] = explicit
 
     text, references = normalize_moss_tts_inputs(inputs)
     ref_audio, ref_text = resolve_moss_reference(references, tts_params)
@@ -161,6 +176,8 @@ def build_moss_tts_local_state(payload: StagePayload) -> MossTTSLocalState:
         instructions=instructions,
         token_count=token_count,
         generation_kwargs=build_generation_kwargs(params, tts_params=tts_params),
+        return_logprob=bool(params.get("return_logprob", False)),
+        return_omni_rollout=bool(params.get("return_omni_rollout", False)),
     )
 
 
@@ -367,9 +384,40 @@ def build_sglang_moss_tts_local_request(
 
     cfg = model.config
     gen_kwargs = prepared.gen_kwargs
+    admission_weight_version = None
+    if getattr(model, "enable_rl", False) and not prepared.state.return_omni_rollout:
+        raise ValueError("RL instances require return_omni_rollout=true")
+    if prepared.state.return_omni_rollout:
+        if not model.enable_rl:
+            raise ValueError(
+                "MOSS rollout requires starting the server with enable_rl=true"
+            )
+        if not prepared.state.return_logprob:
+            raise ValueError("MOSS rollout requires return_logprob=true")
+        for name, expected in {
+            "text_top_p": 1.0,
+            "audio_top_p": 1.0,
+            "text_top_k": -1,
+            "audio_top_k": -1,
+            "audio_repetition_penalty": 1.0,
+        }.items():
+            if gen_kwargs[name] != expected:
+                raise ValueError(f"MOSS rollout requires {name}={expected}")
+        if any(
+            gen_kwargs[name] <= 0 for name in ("text_temperature", "audio_temperature")
+        ):
+            raise ValueError("MOSS rollout requires positive text/audio temperatures")
+        from sglang.srt.runtime_context import get_serving
+
+        version = get_serving().weight_version
+        if version is None:
+            raise RuntimeError("MOSS rollout requires a weight version")
+        admission_weight_version = str(version)
     max_new_tokens = int(
         gen_kwargs.get("max_new_tokens", MOSS_TTS_DEFAULT_MAX_NEW_TOKENS)
     )
+    if prepared.state.return_omni_rollout and max_new_tokens <= 0:
+        raise ValueError("MOSS rollout requires max_new_tokens > 0")
     audio_end = int(cfg.audio_end_token_id)
     sampling_params = SamplingParams(
         max_new_tokens=max_new_tokens,
@@ -398,6 +446,8 @@ def build_sglang_moss_tts_local_request(
         output_ids=req.output_ids,
         req=req,
         state=prepared.state,
+        return_omni_rollout=prepared.state.return_omni_rollout,
+        admission_weight_version=admission_weight_version,
         model_config=cfg,
         prompt_rows=prepared.prompt_rows,
         text_temperature=float(gen_kwargs.get("text_temperature", 1.0)),
@@ -428,12 +478,60 @@ def apply_sglang_moss_tts_local_result(
     data: MossTTSLocalSGLangRequestData,
 ) -> StagePayload:
     state = data.state
-    if not data.output_rows:
+    if not data.output_rows and not data.return_omni_rollout:
         raise RuntimeError(
             "MOSS-TTS Local generated no audio frames. Please retry the request."
         )
-    generated_rows = torch.stack(data.output_rows, dim=0).to(dtype=torch.long)
-    state.audio_codes = generated_rows[:, 1:].detach().cpu()
+    if data.output_rows:
+        state.audio_codes = (
+            torch.stack(data.output_rows)[:, 1:]
+            .detach()
+            .to(dtype=torch.long, device="cpu")
+        )
+    else:
+        state.audio_codes = torch.empty(
+            (0, int(data.model_config.n_vq)), dtype=torch.long
+        )
+    if data.return_omni_rollout:
+        n_vq = int(data.model_config.n_vq)
+        if data.admission_weight_version is None or data.weight_version is None:
+            raise RuntimeError("MOSS rollout is missing its weight version")
+        if data.admission_weight_version != str(data.weight_version):
+            raise RuntimeError("MOSS rollout crossed a weight update")
+        state.finish_reason = str(data.finish_reason)
+        state.weight_version = str(data.weight_version)
+        rollout = build_moss_tts_local_rollout_trace(
+            prompt_rows=data.prompt_rows,
+            decisions=torch.stack(data.output_decisions),
+            decision_logprobs=torch.stack(data.output_decision_logprobs),
+            codes=state.audio_codes,
+            code_logprobs=(
+                torch.stack(data.output_code_logprobs)
+                if data.output_code_logprobs
+                else torch.empty((0, n_vq), dtype=torch.float32)
+            ),
+            finish_reason=state.finish_reason,
+            admission_weight_version=data.admission_weight_version,
+            request_id=payload.request_id,
+            sampling={
+                name: getattr(data, name)
+                for name in (
+                    "text_temperature",
+                    "text_top_p",
+                    "text_top_k",
+                    "audio_temperature",
+                    "audio_top_p",
+                    "audio_top_k",
+                    "audio_repetition_penalty",
+                    "seed",
+                )
+            },
+            model_config=data.model_config,
+        )
+        # note (Zhang Yiyang): Keep tensor routing from walking every trace scalar.
+        state.omni_rollout = json.dumps(rollout, separators=(",", ":")).encode()
+        if not data.output_rows:
+            state.audio_codes = None
 
     state.prompt_tokens = len(data.input_ids) if data.input_ids is not None else 0
     state.completion_tokens = len(data.output_rows)

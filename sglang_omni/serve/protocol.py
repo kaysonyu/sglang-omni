@@ -230,7 +230,7 @@ class RolloutGenerateRequest(BaseModel):
     model: str | None = None
 
     input_ids: list[int] | None = None
-    prompt: str | None = None
+    prompt: str | dict[str, Any] | None = None
     messages: list[RolloutMessage] | None = None
 
     sampling_params: RolloutSamplingParams = Field(
@@ -247,6 +247,8 @@ class RolloutGenerateRequest(BaseModel):
 
     return_logprob: bool = True
     return_omni_rollout: bool = False
+    return_audio: bool = Field(default=True, strict=True)
+    response_format: Literal["wav", "flac"] = "wav"
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
 
@@ -647,6 +649,7 @@ class UpdateWeightsFromDistributedRequest(AdminRequestBase):
     weight_version: str | None = None
     load_format: str | None = None
     torch_empty_cache: bool = False
+    keep_pause: bool = False
 
 
 class InitWeightsUpdateGroupRequest(AdminRequestBase):

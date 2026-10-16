@@ -3513,7 +3513,10 @@ def test_unimplemented_tensor_weight_update_returns_501() -> None:
     assert "update_weights_from_disk" in resp.json()["error"]["message"]
 
 
-def test_distributed_weight_update_routes_forward_to_client() -> None:
+@pytest.mark.parametrize("keep_pause", [None, False, True])
+def test_distributed_weight_update_routes_forward_to_client(
+    keep_pause: bool | None,
+) -> None:
     admin = AdminClient()
     client = TestClient(create_app(admin, model_name="qwen3-omni"))
 
@@ -3537,6 +3540,7 @@ def test_distributed_weight_update_routes_forward_to_client() -> None:
             "group_name": "weight_update_group",
             "weight_version": "v2",
             "timeout_s": 0,
+            **({"keep_pause": keep_pause} if keep_pause is not None else {}),
         },
     )
     destroy = client.post(
@@ -3576,6 +3580,7 @@ def test_distributed_weight_update_routes_forward_to_client() -> None:
                 "abort_all_requests": False,
                 "weight_version": "v2",
                 "torch_empty_cache": False,
+                "keep_pause": False if keep_pause is None else keep_pause,
             },
             None,
             0,

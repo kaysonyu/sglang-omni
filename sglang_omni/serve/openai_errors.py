@@ -7,6 +7,9 @@ import re
 
 _BAD_REQUEST_MARKERS = (
     "Unsupported language:",
+    "Prism RL request requires",
+    "Prism score input:",
+    "for PrismPrompt",
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
     "Request requires more tokens than the thinker KV cache can hold",
