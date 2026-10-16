@@ -219,14 +219,14 @@ class PrismTransformer(nn.Module):
 
 class MossTTSPrismSGLangModel(nn.Module):
     enable_rl = False
-    teacher_weight_sha256: str | None = None
+    enable_action_scoring: bool = False
     teacher_weight_version: str | None = None
     model_identity: dict[str, str | int | bool] | None = None
 
     def rollout_model_info(
         self,
     ) -> dict[str, bool | str | list[int] | dict[str, str | int | bool] | None]:
-        is_teacher = self.teacher_weight_sha256 is not None
+        is_teacher = self.enable_action_scoring
         return {
             "model_identity": self.model_identity,
             "rollout_schema_versions": [2] if self.enable_rl or is_teacher else [],
@@ -236,7 +236,6 @@ class MossTTSPrismSGLangModel(nn.Module):
             "supports_weight_update": not is_teacher,
             **(
                 {
-                    "teacher_weight_sha256": self.teacher_weight_sha256,
                     "weight_version": self.teacher_weight_version,
                 }
                 if is_teacher

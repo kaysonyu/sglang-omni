@@ -15,7 +15,6 @@ from torch import nn
 from sglang_omni.models.moss_tts_prism.config import MossTTSPrismScorePipelineConfig
 from sglang_omni.models.moss_tts_prism.scoring import (
     PrismScoreModelRunner,
-    PrismTeacherWeightChecker,
     build_score_request,
     score_result,
 )
@@ -115,9 +114,61 @@ def test_input_hash_and_model_geometry() -> None:
         changed.validate_model(model_config(), 6)
 
 
+@pytest.mark.parametrize("field", ["prompt_rows", "successor_audio_codes", "codes"])
+@pytest.mark.parametrize("invalid", [-1, 17, 2**80])
+def test_audio_vocabulary_rejects_unbounded_integers(field: str, invalid: int) -> None:
+    sample = score_input()
+    values = getattr(sample, field)
+    values[0][1] = invalid
+    with pytest.raises(ValueError, match="Audio code is outside"):
+        sample.validate_model(model_config(), 128)
+
+
+def test_minimal_stop_preserves_input_and_hash() -> None:
+    sample = PrismScoreInput(
+        sample_id="empty",
+        layout="moss_prism_typed_v1",
+        prompt_rows=[[7, 0, 0, 0]],
+        item_kind=[0],
+        audio_role=[0],
+        successor_audio_mask=[False],
+        successor_audio_codes=[[0, 0, 0]],
+        target_history_retention_mask=[[True, True, True]],
+        codes=[],
+        finish_reason="stop",
+    )
+    original = sample.model_dump()
+    digest = sample.input_sha256()
+    sample.validate_model(model_config(), 1)
+    assert sample.model_dump() == original
+    assert sample.input_sha256() == digest
+
+
+@pytest.mark.parametrize(
+    "corruption", ["text_audio", "audio_text", "successor", "anchor"]
+)
+def test_prompt_roles_and_reference_edges_remain_strict(corruption: str) -> None:
+    sample = score_input()
+    if corruption == "text_audio":
+        sample.prompt_rows[2][1] = 1
+        expected = "item_kind"
+    elif corruption == "audio_text":
+        sample.prompt_rows[1][0] = 5
+        expected = "item_kind"
+    elif corruption == "successor":
+        sample.successor_audio_mask[0] = False
+        expected = "successor"
+    else:
+        sample.prompt_rows[0][0] = 5
+        expected = "anchor"
+    with pytest.raises(ValueError, match=expected):
+        sample.validate_model(model_config(), 128)
+
+
 @pytest.mark.parametrize(
     "updates",
     [
+        {"version": 1},
         {"codes": [[0, 1]]},
         {"item_kind": [0]},
         {"temperature": 0},
@@ -174,7 +225,7 @@ def tiny_teacher() -> MossTTSPrismSGLangModel:
     model.n_vq = 3
     model.model = None
     model.decode_inputs = None
-    model.teacher_weight_sha256 = "frozen"
+    model.enable_action_scoring = True
     model.teacher_weight_version = "teacher:0"
     model.model_identity = {"n_vq": 3}
     model.transformer = nn.Module()
@@ -209,8 +260,13 @@ def tiny_teacher() -> MossTTSPrismSGLangModel:
 @pytest.mark.parametrize(
     "finish,frames", [("stop", 0), ("stop", 3), ("length", 1), ("length", 3)]
 )
-def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) -> None:
+@pytest.mark.parametrize("stop_scale", [1.0, 1000.0])
+def test_teacher_matches_forced_generation_prefixes(
+    finish: str, frames: int, stop_scale: float
+) -> None:
     model = tiny_teacher()
+    with torch.no_grad():
+        model.stop_head.weight.mul_(stop_scale)
     sample = score_input(finish_reason=finish, frames=frames)
     request = request_for(sample, model)
     runner = PrismScoreModelRunner.__new__(PrismScoreModelRunner)
@@ -228,7 +284,7 @@ def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) ->
         lengths, SimpleNamespace(is_prefill_only=True), [request]
     ).logits_output
     predictions = range(len(sample.prompt_rows) - 1, len(carrier.rows))
-    expected_codes, expected_stop = [], []
+    expected_codes, expected_stop_logprobs = [], []
     for frame, position in enumerate(predictions):
         logprobs = torch.empty(1, model.n_vq)
         action = sample.codes[frame] if frame < frames else [0] * model.n_vq
@@ -256,7 +312,10 @@ def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) ->
             SimpleNamespace(extend_seq_lens_cpu=[position + 1]),
         )
         expected_codes.append(logprobs[0])
-        expected_stop.append(output.next_token_logits.softmax(-1)[0, 1])
+        stop_action = int(frame == frames)
+        expected_stop_logprobs.append(
+            output.next_token_logits.log_softmax(-1)[0, stop_action]
+        )
     torch.testing.assert_close(
         actual.customized_info["code_logprobs"][:frames],
         torch.stack(expected_codes)[:frames],
@@ -264,11 +323,16 @@ def test_teacher_matches_forced_generation_prefixes(finish: str, frames: int) ->
         rtol=1e-6,
     )
     torch.testing.assert_close(
-        actual.customized_info["stop_probabilities"],
-        torch.stack(expected_stop),
-        atol=2e-6,
+        actual.customized_info["selected_stop_logprobs"],
+        torch.stack(expected_stop_logprobs),
+        atol=2e-4,
         rtol=1e-6,
     )
+    selected = actual.customized_info["selected_stop_logprobs"]
+    assert torch.isfinite(selected).all()
+    if stop_scale > 1:
+        probabilities = selected.exp()
+        assert ((probabilities == 0) | (probabilities == 1)).any()
 
 
 def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
@@ -296,10 +360,15 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
     for sample, request in zip(samples, requests, strict=True):
         result = json.loads(score_result(request.data).data["omni_rollout"])
         assert len(result["code_logprobs"]) == len(sample.codes)
-        assert len(result["stop_probabilities"]) == sample.prediction_count
+        assert result["version"] == 2
+        assert len(result["selected_stop_logprobs"]) == sample.prediction_count
+        assert all(
+            isinstance(value, float) for value in result["selected_stop_logprobs"]
+        )
+        assert "stop_probabilities" not in result and "stop_logprobs" not in result
         assert result["input_sha256"] == sample.input_sha256()
         assert result["sample_id"] == sample.sample_id
-        assert result["teacher_weight_sha256"] == "frozen"
+        assert "teacher_weight_sha256" not in result
         assert result["weight_version"] == "teacher:0"
     first = requests[0].data.score_result
     rows = len(requests[0].data.inputs.rows)
@@ -311,21 +380,23 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
     torch.testing.assert_close(
         torch.tensor(first["code_logprobs"]), alone.customized_info["code_logprobs"]
     )
+    torch.testing.assert_close(
+        torch.tensor(first["selected_stop_logprobs"]),
+        alone.customized_info["selected_stop_logprobs"],
+    )
 
 
-def test_teacher_checksum_ignores_runtime_buffers() -> None:
+def test_teacher_capabilities_do_not_depend_on_a_weight_checksum() -> None:
     model = tiny_teacher()
-    model.register_buffer("cache", torch.zeros(2), persistent=False)
-    checker = PrismTeacherWeightChecker(SimpleNamespace(model=model))
-    checksum = checker.checksum()["per_gpu_checksum"]
-    model.cache.add_(1)
-    assert checker.checksum()["per_gpu_checksum"] == checksum
-    with torch.no_grad():
-        model.audio_lm_heads[0].weight.add_(1)
-    assert checker.checksum()["per_gpu_checksum"] != checksum
     metadata = model.rollout_model_info()
-    assert metadata["supports_action_scoring"]
-    assert not metadata["supports_weight_update"]
+    assert metadata["supports_action_scoring"] is True
+    assert metadata["supports_weight_update"] is False
+    assert metadata["weight_version"] == "teacher:0"
+    assert "teacher_weight_sha256" not in metadata
+    model.enable_action_scoring = False
+    metadata = model.rollout_model_info()
+    assert metadata["supports_action_scoring"] is False
+    assert metadata["supports_weight_update"] is True
 
 
 def test_prism_endpoint_dispatch_order_and_validation() -> None:
