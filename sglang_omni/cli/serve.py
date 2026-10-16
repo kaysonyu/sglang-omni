@@ -334,6 +334,12 @@ def serve(
         Literal["debug", "info", "warning", "error", "critical"],
         typer.Option(help="Log level (default: info)."),
     ] = "info",
+    log_level_http: Annotated[
+        Literal["debug", "info", "warning", "error", "critical"],
+        typer.Option(
+            help="HTTP access log level: warning keeps 4xx/5xx; info also logs successful requests."
+        ),
+    ] = "warning",
     enable_realtime: Annotated[
         bool,
         typer.Option(
@@ -355,6 +361,7 @@ def serve(
         level=getattr(logging, log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    logging.getLogger().setLevel(log_level.upper())
 
     validate_colocate_cli_request(
         colocate=colocate,
@@ -427,6 +434,7 @@ def serve(
         port=port,
         model_name=model_name,
         log_level=log_level,
+        log_level_http=log_level_http,
         enable_realtime=enable_realtime,
         allowed_local_media_path=validate_allowed_local_media_path(
             allowed_local_media_path

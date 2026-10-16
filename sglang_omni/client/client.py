@@ -32,6 +32,7 @@ from sglang_omni.client.types import (
     UsageInfo,
 )
 from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.profiler.event_recorder import emit
 from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
 
 
@@ -70,7 +71,10 @@ class Client:
             return
 
         result = await self._coordinator.submit(req_id, omni_request)
-        yield self._result_builder(req_id, result)
+        emit(request_id=req_id, stage="client", event_name="client_result_build_start")
+        result_chunk = self._result_builder(req_id, result)
+        emit(request_id=req_id, stage="client", event_name="client_result_build_end")
+        yield result_chunk
 
     # ------------------------------------------------------------------
     # High-level: non-streaming completion
@@ -129,6 +133,11 @@ class Client:
 
         audio: CompletionAudio | None = None
         if audio_chunks:
+            emit(
+                request_id=request_id,
+                stage="client",
+                event_name="client_audio_encode_start",
+            )
             if len(audio_chunks) == 1:
                 combined = audio_chunks[0]
             else:
@@ -146,8 +155,18 @@ class Client:
                 transcript=full_text if full_text else None,
                 sample_rate=sample_rate or DEFAULT_SAMPLE_RATE,
             )
+            emit(
+                request_id=request_id,
+                stage="client",
+                event_name="client_audio_encode_end",
+            )
 
-        return CompletionResult(
+        emit(
+            request_id=request_id,
+            stage="client",
+            event_name="client_completion_build_start",
+        )
+        completion = CompletionResult(
             request_id=request_id,
             text=full_text,
             audio=audio,
@@ -160,6 +179,12 @@ class Client:
             weight_version=weight_version,
             language=language,
         )
+        emit(
+            request_id=request_id,
+            stage="client",
+            event_name="client_completion_build_end",
+        )
+        return completion
 
     # ------------------------------------------------------------------
     # High-level: streaming completion

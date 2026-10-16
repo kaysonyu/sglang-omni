@@ -68,6 +68,11 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.profiler.event_recorder import emit
+from sglang_omni.profiler.http_events import (
+    RequestProfileMiddleware,
+    current_http_profile_id,
+)
 from sglang_omni.serve.action_scoring import register_action_scoring
 from sglang_omni.serve.generation_params import (
     record_explicit_generation_params as _record_explicit_generation_params,
@@ -245,6 +250,7 @@ def create_app(
         Configured FastAPI application.
     """
     app = FastAPI(title="sglang-omni", version=__version__)
+    app.add_middleware(RequestProfileMiddleware, stage="frontend_http")
 
     app.add_middleware(
         CORSMiddleware,
@@ -1048,9 +1054,20 @@ def register_generate(app: FastAPI) -> None:
 
         request_id = str(uuid.uuid4())
         audio_format = req.response_format
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_validated",
+            metadata={"http_request_id": current_http_profile_id()},
+        )
 
         try:
             gen_req = build_rollout_generate_request(req)
+            emit(
+                request_id=request_id,
+                stage="frontend",
+                event_name="generate_request_built",
+            )
             result = await client.completion(
                 gen_req,
                 request_id=request_id,
@@ -1068,8 +1085,31 @@ def register_generate(app: FastAPI) -> None:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_completion_ready",
+        )
         response = build_generate_response(req, result, audio_format)
-        return JSONResponse(content=response.model_dump())
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_response_built",
+        )
+        response_payload = response.model_dump()
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_response_dumped",
+        )
+        encoded_response = JSONResponse(content=response_payload)
+        emit(
+            request_id=request_id,
+            stage="frontend",
+            event_name="generate_response_encoded",
+            metadata={"bytes": len(encoded_response.body)},
+        )
+        return encoded_response
 
 
 def rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
