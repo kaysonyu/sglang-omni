@@ -17,6 +17,8 @@ from sglang_omni.models.moss_tts_prism.scoring_protocol import (
     PrismScoreBatch,
     PrismScoreInput,
 )
+from sglang_omni.profiler.event_recorder import emit
+from sglang_omni.profiler.http_events import current_http_profile_id
 from sglang_omni.serve.openai_errors import is_bad_request_error
 
 
@@ -38,6 +40,15 @@ def register_action_scoring(
             sample: LocalScoreInput | PrismScoreInput,
         ) -> dict[str, JsonValue]:
             request_id = str(uuid.uuid4())
+            emit(
+                request_id=request_id,
+                stage="score_frontend",
+                event_name="score_validated",
+                metadata={
+                    "http_request_id": current_http_profile_id(),
+                    "sample_id": sample.sample_id,
+                },
+            )
             request = GenerateRequest(
                 prompt="",
                 stream=False,
@@ -45,17 +56,32 @@ def register_action_scoring(
                 sampling=SamplingParams(max_new_tokens=0),
                 extra_params={parameter: sample.model_dump()},
             )
+            emit(
+                request_id=request_id,
+                stage="score_frontend",
+                event_name="score_request_built",
+            )
             try:
                 result = await client.completion(request, request_id=request_id)
             except asyncio.CancelledError:
                 await client.abort(request_id)
                 raise
+            emit(
+                request_id=request_id,
+                stage="score_frontend",
+                event_name="score_completion_ready",
+            )
             score = result.omni_rollout
             if (
                 not isinstance(score, dict)
                 or score.get("input_sha256") != sample.input_sha256()
             ):
                 raise ValueError("Backend did not score the supplied actions")
+            emit(
+                request_id=request_id,
+                stage="score_frontend",
+                event_name="score_verified",
+            )
             return score
 
         tasks = [asyncio.create_task(score_one(sample)) for sample in samples]
@@ -73,6 +99,13 @@ def register_action_scoring(
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        profile_id = current_http_profile_id()
+        if profile_id is not None:
+            emit(
+                request_id=profile_id,
+                stage="score_frontend",
+                event_name="score_response_ready",
+            )
         return {"version": 1, "results": results}
 
     if "MossTTSPrismModel" in (architectures or []):
