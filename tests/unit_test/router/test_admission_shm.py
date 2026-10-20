@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import struct
 import threading
 import time
@@ -14,6 +15,63 @@ from sglang_omni_router.python.admission_shm import (
     admission_file_size,
 )
 from sglang_omni_router.python.proxy import AdmissionController
+
+
+@pytest.mark.asyncio
+async def test_async_admission_waits_for_live_writer_without_rejection() -> None:
+    buffer = _buf()
+    reader = _admission(buffer, 0)
+    writer = _admission(buffer, 1)
+    marker = writer._own.begin_write()
+    pending = asyncio.create_task(reader.acquire(timeout_s=0.2))
+    await asyncio.sleep(0.01)
+    assert not pending.done()
+    writer._own.end_write(marker)
+    assert await pending
+    assert reader.to_dict()["rejected_total"] == 0
+    reader.release()
+    assert reader.inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_async_admission_dead_writer_is_bounded_and_reclaims_capacity() -> None:
+    buffer = _buf()
+    reader = _admission(buffer, 0)
+    writer = _admission(buffer, 1)
+    writer._own.begin_write()
+    assert not await asyncio.wait_for(reader.acquire(timeout_s=0.02), timeout=0.2)
+    writer._own.reclaim()
+    assert await reader.acquire(timeout_s=0.2)
+    reader.release()
+    assert reader.to_dict()["rejected_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_async_admission_cancellation_does_not_leak_permits() -> None:
+    buffer = _buf()
+    reader = _admission(buffer, 0)
+    writer = _admission(buffer, 1)
+    marker = writer._own.begin_write()
+    pending = asyncio.create_task(reader.acquire(timeout_s=0.2))
+    await asyncio.sleep(0.005)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    writer._own.end_write(marker)
+    assert reader.inflight == 0
+    assert reader.pending_stability_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_async_admission_preserves_capacity_and_fencing() -> None:
+    buffer = _buf()
+    reader = _admission(buffer, 0, bound=1)
+    assert await reader.acquire(timeout_s=0.2)
+    assert not await reader.acquire(timeout_s=0.2)
+    reader.release()
+    reader._own.reclaim()
+    assert not await reader.acquire(timeout_s=0.2)
+    assert reader.inflight == 0
 
 
 def _buf(slots: int = 3) -> bytearray:

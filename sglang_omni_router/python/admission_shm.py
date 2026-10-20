@@ -43,6 +43,7 @@ Documented semantics (the bound is a shedding knob, not an invariant):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import platform
 import struct
@@ -82,6 +83,8 @@ _READ_BACKOFF_LIMIT = 20_000
 # per request would burn the spin budget (and a log line) on every request for
 # a whole poll interval; cache the fail-closed shed and re-probe at this rate.
 _UNSTABLE_REPROBE_SECS = 0.05
+STABILITY_INITIAL_BACKOFF_SECS = 0.001
+STABILITY_MAX_BACKOFF_SECS = 0.01
 
 assert struct.calcsize(_SLOT_FORMAT) == SLOT_SIZE
 
@@ -256,6 +259,7 @@ class SharedAdmission:
         self._rejected_total = 0
         self._sibling_unstable = False
         self._sibling_probed_at = 0.0
+        self.pending_stability_reads: int = 0
         self.write_own()  # claim the slot
 
     def write_own(self) -> None:
@@ -325,6 +329,9 @@ class SharedAdmission:
             self.write_own()
             return False
         self.mark_sibling_stable()
+        return self.admit_snapshot(total)
+
+    def admit_snapshot(self, total: int) -> bool:
         if total >= self._max_inflight:
             self._rejected_total += 1
             self.write_own()
@@ -335,6 +342,48 @@ class SharedAdmission:
             self._peak_sum = observed
         self.write_own()
         return True
+
+    async def acquire(self, *, timeout_s: float) -> bool:
+        """Yield on transient slot writes before forwarding any request bytes."""
+        if timeout_s <= 0:
+            raise ValueError("Admission stability timeout must be positive")
+        elif self.pending_stability_reads >= self._max_inflight:
+            return self.try_acquire()
+        else:
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            deadline = started + timeout_s
+            backoff = STABILITY_INITIAL_BACKOFF_SECS
+            waited = False
+            self.pending_stability_reads += 1
+            try:
+                while True:
+                    try:
+                        if not self.still_owner():
+                            self.fenced()
+                            return False
+                        else:
+                            total = self.total_inflight()
+                    except SeqlockUnstableError:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            logger.warning(
+                                f"shared admission stability deadline expired after {timeout_s}s"
+                            )
+                            return self.try_acquire()
+                        else:
+                            waited = True
+                            await asyncio.sleep(min(backoff, remaining))
+                            backoff = min(2 * backoff, STABILITY_MAX_BACKOFF_SECS)
+                    else:
+                        if waited:
+                            logger.warning(
+                                f"shared admission recovered after {loop.time() - started:.6f}s before forwarding"
+                            )
+                        self.mark_sibling_stable()
+                        return self.admit_snapshot(total)
+            finally:
+                self.pending_stability_reads -= 1
 
     def release(self) -> None:
         try:

@@ -21,6 +21,7 @@ from sglang_omni.profiler.event_recorder import emit
 from sglang_omni.profiler.http_events import current_http_profile_id
 from sglang_omni.serve.speech_errors import openai_error_payload
 from sglang_omni.serve.speech_limits import MAX_VOICE_UPLOAD_BODY_BYTES
+from sglang_omni_router.python.admission_shm import SharedAdmission
 from sglang_omni_router.python.config import Capability, RouterConfig
 from sglang_omni_router.python.route_metadata import (
     ROUTE_HEADER_NAMES,
@@ -39,6 +40,7 @@ from sglang_omni_router.python.voice_routing import VoiceMutation, VoiceRoutingS
 from sglang_omni_router.python.worker import Worker
 
 logger = logging.getLogger(__name__)
+ADMISSION_STABILITY_WAIT_SECS = 1.0
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -289,7 +291,15 @@ class ProxyHandler:
     async def forward_model_request(self, request: Request, path: str) -> Response:
         # Note (Jiaxin Deng): reject before reading the body; past the bound
         # the relay must shed load, not queue it.
-        if not self._admission.try_acquire():
+        if isinstance(self._admission, SharedAdmission):
+            admitted = await self._admission.acquire(
+                timeout_s=min(
+                    ADMISSION_STABILITY_WAIT_SECS, self._config.request_timeout_secs
+                )
+            )
+        else:
+            admitted = self._admission.try_acquire()
+        if not admitted:
             self.log_route_rejection(
                 request=request,
                 path=path,
