@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prism schedule, carrier, loader and streaming contracts."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import quote
 
 import pytest
 import torch
@@ -598,6 +600,115 @@ def test_preprocess_unified_request_preserves_named_references_and_segment_contr
     torch.testing.assert_close(arguments["references"]["audio3"], codes)
     reference_encoder.encode.assert_called_once_with("/shared/reference.wav")
     assert request.inputs["references"] == {"audio3": "/shared/reference.wav"}
+
+
+def test_preprocess_reads_pinned_lance_codes_beside_audio_references(
+    tmp_path, speech_processor
+):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+    frames = pa.list_(pa.list_(pa.int16(), 3))
+    table = tmp_path / "reference table"
+    rows = pa.array([[[1, 2, 3], [4, 5, 6]], [[7, 0, 1]]], type=frames)
+    lance.write_dataset(pa.table({"ref1": rows}), table)
+    replacement = pa.array([[[0, 0, 0]]], type=frames)
+    lance.write_dataset(pa.table({"ref1": replacement}), table, mode="overwrite")
+    speech_processor.model_config.speech_vocab_size = 8
+    audio_codes = torch.tensor([[3, 3]])
+    reference_encoder = SimpleNamespace(encode=Mock(return_value=audio_codes))
+    references = {
+        "audio1": f"lance://{quote(str(table))}?version=1&row=0&column=ref1",
+        "audio2": "/shared/reference.wav",
+        "audio3": f"lance://{quote(str(table))}?version=1&row=1&column=ref1",
+    }
+    preprocess_prism_payload(
+        StagePayload(
+            request_id="lance",
+            request=OmniRequest(inputs={"script": "hello", "references": references}),
+            data={},
+        ),
+        processor=speech_processor,
+        reference_encoder=reference_encoder,
+    )
+    loaded = speech_processor.build_user_message.call_args.args[0]["references"]
+    assert loaded["audio1"].dtype == torch.long
+    assert loaded["audio1"].tolist() == [[1, 2], [4, 5]]
+    assert loaded["audio3"].tolist() == [[7, 0]]
+    torch.testing.assert_close(loaded["audio2"], audio_codes)
+    reference_encoder.encode.assert_called_once_with("/shared/reference.wav")
+    preprocess_prism_payload(
+        StagePayload(
+            request_id="codes-only",
+            request=OmniRequest(
+                inputs={
+                    "script": "hello",
+                    "references": {"audio1": references["audio1"]},
+                }
+            ),
+            data={},
+        ),
+        processor=speech_processor,
+        reference_encoder=None,
+    )
+    loaded = speech_processor.build_user_message.call_args.args[0]["references"]
+    assert loaded["audio1"].tolist() == [[1, 2], [4, 5]]
+
+
+@pytest.mark.parametrize(
+    "uri,message",
+    [
+        ("lance://{table}?version=1&row=0", "must be lance:///"),
+        ("lance://{table}?version=1&row=0&row=1&column=good", "must be lance:///"),
+        ("lance://{table}?version=one&row=0&column=good", "must be lance:///"),
+        ("lance://host{table}?version=1&row=0&column=good", "must be lance:///"),
+        ("lance:relative?version=1&row=0&column=good", "must be lance:///"),
+        ("lance://{table}?version=1&row=0&column=scalar", "fixed-size integer"),
+        ("lance://{table}?version=1&row=0&column=narrow", "fewer than n_vq"),
+        ("lance://{table}?version=1&row=1&column=good", "codes outside"),
+        ("lance://{table}?version=1&row=2&column=good", "0 frames"),
+        ("lance://{table}?version=1&row=3&column=good", "1251 frames"),
+    ],
+)
+def test_lance_reference_rejects_malformed_uri_and_codes(tmp_path, uri, message):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+    from sglang_omni.models.moss_tts_prism.reference_codes import load_reference_codes
+
+    good = [[[1, 2, 3]], [[9, 0, 0]], [], [[1, 2, 3]] * 1251]
+    columns = {
+        "good": pa.array(good, type=pa.list_(pa.list_(pa.int16(), 3))),
+        "narrow": pa.array([[[1]]] * 4, type=pa.list_(pa.list_(pa.int16(), 1))),
+        "scalar": pa.array([1, 2, 3, 4], type=pa.int32()),
+    }
+    lance.write_dataset(pa.table(columns), tmp_path / "table")
+    with pytest.raises(ValueError, match=message):
+        load_reference_codes(
+            uri.format(table=quote(str(tmp_path / "table"))),
+            n_vq=2,
+            speech_vocab_size=8,
+        )
+
+
+def test_lance_reference_without_pylance_names_the_package(
+    monkeypatch, speech_processor
+):
+    monkeypatch.setitem(
+        sys.modules, "sglang_omni.models.moss_tts_prism.reference_codes", None
+    )
+    references = {"audio1": "lance:///table?version=1&row=0&column=ref1"}
+    with pytest.raises(RuntimeError, match="pylance"):
+        preprocess_prism_payload(
+            StagePayload(
+                request_id="no-pylance",
+                request=OmniRequest(
+                    inputs={"script": "hello", "references": references}
+                ),
+                data={},
+            ),
+            processor=speech_processor,
+            reference_encoder=None,
+        )
+    speech_processor.build_user_message.assert_not_called()
 
 
 @pytest.mark.parametrize(
