@@ -37,15 +37,26 @@ prompt request through `/generate`:
 - `script`: nonempty text or an array of `{"text": "...", "local_instruction": {...}}` segments.
 - `global_instruction`: an attribute object. An explicit `Language` entry adds
   language guidance; reward metadata does not supply this condition.
-- `references`: a mapping from named audio slots to local paths or audio data URIs.
-  Slots may be noncontiguous, such as `audio3` and `audio10`.
+- `references`: a mapping from named audio slots to local paths, audio data URIs,
+  or stored codes (`lance://` URIs, below). Slots may be noncontiguous, such as
+  `audio3` and `audio10`, and one request may combine these forms.
 - `reference_attributes`: explicit `timbre`, `accent`, `prosody`, and `emotion`
   bindings to a provided audio slot or `none`.
 - `global_tokens`: an optional positive target frame count, independent of the
   generation limit.
 
-The service validates the request and encodes its reference audio, then calls
-`processor.build_user_message(request)`. The checkpoint processor owns attribute
+A reference written as
+`lance:///<table>?version=<version>&row=<row>&column=<column>` skips the codec
+encoder and reads one row of a Lance table at the pinned version. The column must
+hold a list of fixed-size integer frames, such as the
+`list<fixed_size_list<int16>[32]>` reference columns of the pretraining tables.
+Prism uses the first `n_vq` quantizers; codes must lie in `[0, speech_vocab_size)`,
+and a reference has 1 to 1250 frames (100 s, the reference audio limit).
+Percent-encode the table path. The server environment needs the `pylance` package
+only when requests use these references.
+
+The service validates the request, encodes its reference audio or reads its stored
+codes, then calls `processor.build_user_message(request)`. The checkpoint processor owns attribute
 normalization, ordering, rendering, and renderer revision. Checkpoints must
 include `prompt_protocol.py` and preserve the typed input layout.
 

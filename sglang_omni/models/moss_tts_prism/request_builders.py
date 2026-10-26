@@ -7,6 +7,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlsplit
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -221,13 +222,27 @@ def preprocess_prism_payload(
         )
     references = {}
     for slot, uri in structured.references.items():
-        if reference_encoder is None:
+        if urlsplit(uri).scheme == "lance":
+            # note (Kang Yu): pylance is optional; only stored-code references need it.
+            try:
+                from sglang_omni.models.moss_tts_prism.reference_codes import (
+                    load_reference_codes,
+                )
+            except ImportError as error:
+                raise RuntimeError(
+                    "MOSS-TTS Prism lance:// references require the pylance package"
+                ) from error
+            codes = load_reference_codes(
+                uri,
+                n_vq=processor.model_config.n_vq,
+                speech_vocab_size=processor.model_config.speech_vocab_size,
+            )
+        elif reference_encoder is None:
             raise ValueError("MOSS-TTS Prism references require an audio encoder")
-        codes = (
-            reference_encoder.encode_data_uri(uri)
-            if _DATA_URI_RE.match(uri)
-            else reference_encoder.encode(uri)
-        )
+        elif _DATA_URI_RE.match(uri):
+            codes = reference_encoder.encode_data_uri(uri)
+        else:
+            codes = reference_encoder.encode(uri)
         references[slot] = codes
     message = processor.build_user_message(
         {**structured.model_dump(), "references": references}
