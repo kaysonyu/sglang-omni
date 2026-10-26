@@ -58,6 +58,7 @@ def score_prism_actions(
     selected_stop_logprobs = torch.empty(
         predictions, dtype=torch.float32, device=hidden.device
     )
+    other_stop_logprobs = torch.empty_like(selected_stop_logprobs)
 
     def read_site(index: int, value: torch.Tensor) -> torch.Tensor | None:
         heads = model.topology.execution_units[index].rvq_heads
@@ -74,11 +75,14 @@ def score_prism_actions(
                     logits = F.linear(
                         normalized.float(), model.stop_head.weight.float()
                     )
-                selected_stop_logprobs[start:stop] = (
-                    logits.log_softmax(dim=-1)
-                    .gather(-1, inputs.stop_actions[start:stop, None])
-                    .squeeze(-1)
-                )
+                stop_logprobs = logits.log_softmax(dim=-1)
+                stop_actions = inputs.stop_actions[start:stop, None]
+                selected_stop_logprobs[start:stop] = stop_logprobs.gather(
+                    -1, stop_actions
+                ).squeeze(-1)
+                other_stop_logprobs[start:stop] = stop_logprobs.gather(
+                    -1, 1 - stop_actions
+                ).squeeze(-1)
             for head in heads:
                 logits = model.audio_lm_heads[head - 1](normalized)
                 code_logprobs[start:stop, head - 1] = selected_action_logprobs(
@@ -113,6 +117,7 @@ def score_prism_actions(
         customized_info={
             "code_logprobs": code_logprobs,
             "selected_stop_logprobs": selected_stop_logprobs,
+            "other_stop_logprobs": other_stop_logprobs,
         },
     )
 
@@ -325,9 +330,11 @@ class PrismScoreModelRunner(ModelRunner):
         scores = result.logits_output.customized_info
         code_logprobs = scores["code_logprobs"].cpu()
         selected_stop_logprobs = scores["selected_stop_logprobs"].cpu()
+        other_stop_logprobs = scores["other_stop_logprobs"].cpu()
         if (
             not torch.isfinite(code_logprobs).all()
             or not torch.isfinite(selected_stop_logprobs).all()
+            or not torch.isfinite(other_stop_logprobs).all()
         ):
             raise RuntimeError("Prism teacher scores must be finite")
         cursor = 0
@@ -341,6 +348,9 @@ class PrismScoreModelRunner(ModelRunner):
                     cursor : cursor + len(sample.codes)
                 ].tolist(),
                 selected_stop_logprobs=selected_stop_logprobs[
+                    cursor : cursor + sample.prediction_count
+                ].tolist(),
+                other_stop_logprobs=other_stop_logprobs[
                     cursor : cursor + sample.prediction_count
                 ].tolist(),
                 finish_reason=sample.finish_reason,
