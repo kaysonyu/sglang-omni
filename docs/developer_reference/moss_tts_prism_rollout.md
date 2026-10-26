@@ -140,15 +140,19 @@ response = requests.post(teacher_url + "/score_actions", json={"samples": [sampl
 
 The teacher forces the supplied codes without sampling or applying its stop
 threshold. Version 2 results contain selected `code_logprobs` of
-shape `[frames, n_vq]` and `selected_stop_logprobs` of shape `[observations]`.
+shape `[frames, n_vq]`, plus `selected_stop_logprobs` and `other_stop_logprobs`,
+each of shape `[observations]`.
 The student actions are determined by the trajectory: one continue for every
 frame, followed by a stop only when `finish_reason` is `stop`. The teacher
-selects these actions directly from FP32 log-softmax scores before returning
-them. It does not return probabilities or unselected stop scores. This preserves
-finite logprobs even for actions whose probabilities would underflow to zero.
+selects both the supplied action and the other binary action directly from the
+same FP32 log-softmax. The pair preserves the complete stop distribution even
+when the selected logprob rounds to zero or a probability underflows. Clients
+computing stop forward KL must require both fields instead of reconstructing the
+other logprob from the selected one. The additional `other_stop_logprobs` field
+is additive within version 2; selected-score clients can ignore it.
 Temperature scales only the RVQ logits. Natural stops include the final stop
 observation; length-limited trajectories do not. Zero-frame natural stops return
-an empty code score list and one selected stop logprob.
+an empty code score list and one entry in each stop logprob list.
 
 The HTTP batch envelope remains version 1; each Prism sample and result uses
 version 2. Upgrade the scoring client and teacher together. Version 1 Prism

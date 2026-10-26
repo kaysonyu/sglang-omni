@@ -141,6 +141,7 @@ class PrismScoreResult(TypedDict):
     input_sha256: str
     code_logprobs: list[list[float]]
     selected_stop_logprobs: list[float]
+    other_stop_logprobs: list[float]
     finish_reason: str
     temperature: float
     weight_version: str

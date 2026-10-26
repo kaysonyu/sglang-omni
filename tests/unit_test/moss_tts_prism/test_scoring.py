@@ -284,7 +284,7 @@ def test_teacher_matches_forced_generation_prefixes(
         lengths, SimpleNamespace(is_prefill_only=True), [request]
     ).logits_output
     predictions = range(len(sample.prompt_rows) - 1, len(carrier.rows))
-    expected_codes, expected_stop_logprobs = [], []
+    expected_codes, expected_stop_logprobs, expected_other_logprobs = [], [], []
     for frame, position in enumerate(predictions):
         logprobs = torch.empty(1, model.n_vq)
         action = sample.codes[frame] if frame < frames else [0] * model.n_vq
@@ -316,6 +316,9 @@ def test_teacher_matches_forced_generation_prefixes(
         expected_stop_logprobs.append(
             output.next_token_logits.log_softmax(-1)[0, stop_action]
         )
+        expected_other_logprobs.append(
+            output.next_token_logits.log_softmax(-1)[0, 1 - stop_action]
+        )
     torch.testing.assert_close(
         actual.customized_info["code_logprobs"][:frames],
         torch.stack(expected_codes)[:frames],
@@ -328,11 +331,53 @@ def test_teacher_matches_forced_generation_prefixes(
         atol=2e-4,
         rtol=1e-6,
     )
+    torch.testing.assert_close(
+        actual.customized_info["other_stop_logprobs"],
+        torch.stack(expected_other_logprobs),
+        atol=2e-4,
+        rtol=1e-6,
+    )
     selected = actual.customized_info["selected_stop_logprobs"]
     assert torch.isfinite(selected).all()
     if stop_scale > 1:
         probabilities = selected.exp()
         assert ((probabilities == 0) | (probabilities == 1)).any()
+
+
+@pytest.mark.parametrize("gap", [-40, -20, -17, -15, -10, 10, 15, 17, 20, 40])
+def test_saturated_stop_scores_preserve_both_binary_actions(gap: int) -> None:
+    model = tiny_teacher()
+    with torch.no_grad():
+        model.prediction_norms[0].weight.zero_()
+        model.prediction_norms[0].bias.zero_()
+        model.prediction_norms[0].bias[0] = 1
+        model.stop_head.weight.zero_()
+        model.stop_head.weight[0, 0] = gap
+    sample = score_input(frames=1)
+    request = request_for(sample, model)
+    runner = PrismScoreModelRunner.__new__(PrismScoreModelRunner)
+    runner.model, runner.device = model, torch.device("cpu")
+    runner.score_chunk_size = 1
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=ScoreAttentionBackend())
+    )
+    rows = len(request.data.inputs.rows)
+    lengths = SimpleNamespace(extend_seq_lens_cpu=[rows], positions=torch.arange(rows))
+    batch = SimpleNamespace(is_prefill_only=True)
+    output = runner.custom_prefill_forward(lengths, batch, [request])
+    runner.post_prefill(output, lengths, batch, [request])
+    result = json.loads(score_result(request.data).data["omni_rollout"])
+    selected = torch.tensor(result["selected_stop_logprobs"])
+    other = torch.tensor(result["other_stop_logprobs"])
+    expected = torch.tensor([[gap, 0], [0, gap]], dtype=torch.float64).log_softmax(-1)
+    torch.testing.assert_close(selected, expected[:, 0].float(), atol=1e-7, rtol=1e-6)
+    torch.testing.assert_close(other, expected[:, 1].float(), atol=1e-7, rtol=1e-6)
+    torch.testing.assert_close(
+        torch.logaddexp(selected, other), torch.zeros_like(selected), atol=1e-7, rtol=0
+    )
+    if abs(gap) >= 17:
+        assert selected.eq(0).any()
+        assert other[selected.eq(0)].item() == -abs(gap)
 
 
 def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
@@ -365,6 +410,17 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
         assert all(
             isinstance(value, float) for value in result["selected_stop_logprobs"]
         )
+        assert len(result["other_stop_logprobs"]) == sample.prediction_count
+        assert all(isinstance(value, float) for value in result["other_stop_logprobs"])
+        torch.testing.assert_close(
+            torch.logaddexp(
+                torch.tensor(result["selected_stop_logprobs"]),
+                torch.tensor(result["other_stop_logprobs"]),
+            ),
+            torch.zeros(sample.prediction_count),
+            atol=1e-7,
+            rtol=0,
+        )
         assert "stop_probabilities" not in result and "stop_logprobs" not in result
         assert result["input_sha256"] == sample.input_sha256()
         assert result["sample_id"] == sample.sample_id
@@ -384,6 +440,27 @@ def test_mixed_scores_keep_boundaries_stop_count_and_input_order() -> None:
         torch.tensor(first["selected_stop_logprobs"]),
         alone.customized_info["selected_stop_logprobs"],
     )
+    torch.testing.assert_close(
+        torch.tensor(first["other_stop_logprobs"]),
+        alone.customized_info["other_stop_logprobs"],
+    )
+
+
+@pytest.mark.parametrize(
+    "field", ["code_logprobs", "selected_stop_logprobs", "other_stop_logprobs"]
+)
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_teacher_rejects_nonfinite_scores(field: str, invalid: float) -> None:
+    scores = {
+        "code_logprobs": torch.zeros(1, 3),
+        "selected_stop_logprobs": torch.zeros(1),
+        "other_stop_logprobs": torch.zeros(1),
+    }
+    scores[field].fill_(invalid)
+    runner = PrismScoreModelRunner.__new__(PrismScoreModelRunner)
+    output = SimpleNamespace(logits_output=SimpleNamespace(customized_info=scores))
+    with pytest.raises(RuntimeError, match="teacher scores must be finite"):
+        runner.post_prefill(output, SimpleNamespace(), SimpleNamespace(), [])
 
 
 def test_teacher_capabilities_do_not_depend_on_a_weight_checksum() -> None:
