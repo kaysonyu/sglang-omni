@@ -56,6 +56,8 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         capture_routes: bool = False,
         enable_async_decode: bool,
         async_decode_min_batch_size: int,
+        prefill_coalesce_requests: int,
+        prefill_coalesce_wait_ms: float,
     ) -> None:
         super().__init__(total_gpu_memory_fraction=total_gpu_memory_fraction)
         if capture_routes and not enable_rl:
@@ -64,6 +66,8 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         self.capture_routes = capture_routes
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
+        self.prefill_coalesce_requests = prefill_coalesce_requests
+        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
 
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | bool]:
         return {
@@ -140,10 +144,12 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
 
     def extra_scheduler_kwargs(
         self,
-    ) -> dict[str, bool | int | PrismStreamOutputBuilder]:
+    ) -> dict[str, bool | int | float | PrismStreamOutputBuilder]:
         return {
             "enable_async_decode": self.enable_async_decode,
             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
             "stream_output_builder": PrismStreamOutputBuilder(),
         }
 

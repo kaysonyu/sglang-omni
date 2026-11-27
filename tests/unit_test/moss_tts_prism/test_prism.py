@@ -746,6 +746,8 @@ def test_unsupported_engine_modes_fail_before_loading(monkeypatch, overrides, me
         MossTTSPrismEngineBuilder(
             enable_async_decode=False,
             async_decode_min_batch_size=2,
+            prefill_coalesce_requests=0,
+            prefill_coalesce_wait_ms=60.0,
         ).validate_before_infrastructure(config)
 
 
@@ -988,6 +990,8 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
         enable_rl=True,
         enable_async_decode=False,
         async_decode_min_batch_size=2,
+        prefill_coalesce_requests=0,
+        prefill_coalesce_wait_ms=60.0,
     ).build(
         model_path,
         device="cuda",
