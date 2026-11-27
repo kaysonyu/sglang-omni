@@ -75,6 +75,7 @@ class PrismRequestData(ARRequestData):
     state: MossTTSLocalState = field(default_factory=MossTTSLocalState)
     prompt: dict[str, torch.Tensor] = field(default_factory=dict)
     output_codes: list[torch.Tensor] = field(default_factory=list)
+    frames_launched: int = 0
     sampling_seed: int = field(default_factory=new_moss_tts_sampling_seed)
     stop_sampling: bool = False
     engine_start_s: float = 0.0

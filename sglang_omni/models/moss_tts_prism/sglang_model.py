@@ -78,6 +78,7 @@ class PrismDecodeInputs:
         capacity: int,
         device: torch.device,
         *,
+        request_slots: int,
         enable_rl: bool = False,
     ) -> None:
         self.enable_rl = enable_rl
@@ -85,6 +86,11 @@ class PrismDecodeInputs:
             capacity, config.n_vq + 1, dtype=torch.long, device=device
         )
         self.rows[:, 0] = config.text_pad_idx
+        # note (Linsey): Each request's last frame stays on the device by request pool slot, so a
+        # lookahead step reads its input without waiting for the host results of the step before it.
+        self.last_codes = torch.zeros(
+            request_slots, config.n_vq, dtype=torch.long, device=device
+        )
         self.item_kind = torch.ones(capacity, dtype=torch.long, device=device)
         self.audio_role = torch.full((capacity,), 2, dtype=torch.long, device=device)
         self.retention = torch.zeros(
@@ -101,19 +107,23 @@ class PrismDecodeInputs:
         self.sampling_ints = torch.zeros(3, capacity, dtype=torch.long, device=device)
         self.top_k, self.seeds, self.positions = self.sampling_ints.unbind()
         self.top_k.fill_(1)
-        # note (Zhang Yiyang): Synchronous decode consumes the previous frame
-        # before reusing these pinned inputs.
-        self.rows_cpu = torch.zeros_like(
-            self.rows, device="cpu", pin_memory=device.type == "cuda"
+        # note (Linsey): Two pinned copies, because a lookahead launch fills one while the copy
+        # queued by the step before it may still read the other.
+        self.floats_cpu = tuple(
+            torch.ones_like(
+                self.sampling_floats, device="cpu", pin_memory=device.type == "cuda"
+            )
+            for _ in range(2)
         )
-        self.rows_cpu[:, 0] = config.text_pad_idx
-        self.floats_cpu = torch.ones_like(
-            self.sampling_floats, device="cpu", pin_memory=device.type == "cuda"
+        self.ints_cpu = tuple(
+            torch.zeros_like(
+                self.sampling_ints, device="cpu", pin_memory=device.type == "cuda"
+            )
+            for _ in range(2)
         )
-        self.ints_cpu = torch.zeros_like(
-            self.sampling_ints, device="cpu", pin_memory=device.type == "cuda"
-        )
-        self.ints_cpu[0].fill_(1)
+        for ints in self.ints_cpu:
+            ints[0].fill_(1)
+        self.host_slot = 0
         self.history = torch.zeros(
             capacity,
             config.n_vq,

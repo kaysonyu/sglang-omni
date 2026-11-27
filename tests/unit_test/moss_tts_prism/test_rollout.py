@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from torch import nn
 
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
@@ -14,6 +15,7 @@ from sglang_omni.models.moss_tts_prism.config import MossTTSPrismPipelineConfig
 from sglang_omni.models.moss_tts_prism.model_runner import (
     STOP_SAMPLING_SEED_XOR,
     MossTTSPrismModelRunner,
+    PinnedStaging,
     sample_prism_tokens,
 )
 from sglang_omni.models.moss_tts_prism.request_builders import (
@@ -188,6 +190,9 @@ def request_payload(carrier):
     )
 
 
+DECODE_STEP = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+
 def request_model():
     return SimpleNamespace(
         route_ids=None,
@@ -272,8 +277,10 @@ def test_stop_observations_survive_reused_output_buffers(carrier, device):
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     runner.model = SimpleNamespace(
         route_ids=None,
+        decode_inputs=None,
         enable_rl=True,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -293,7 +300,7 @@ def test_stop_observations_survive_reused_output_buffers(carrier, device):
             },
         )
     )
-    runner.post_decode(result, None, None, requests)
+    runner.post_decode(result, DECODE_STEP, None, requests)
     token_ids = runner.resolve_host_token_ids(result).tolist()
     runner.post_process_outputs(
         result,
@@ -303,9 +310,10 @@ def test_stop_observations_survive_reused_output_buffers(carrier, device):
             for i, token in enumerate(token_ids)
         },
     )
-    expected = scores[0].clone()
+    # note (Linsey): Recorded steps live on the host, so long generations hold no device memory.
+    expected = scores[0].to("cpu", copy=True)
     scores.zero_()
-    result.logits_output.customized_info["stop_probabilities"].zero_()
+    result.logits_output.next_token_logits.zero_()
     assert token_ids == [8, 9]
     assert len(requests[0].data.output_codes) == 1
     assert not requests[1].data.output_codes
@@ -324,8 +332,10 @@ def test_sampled_stop_controls_emission_and_records_selected_scores(
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     runner.model = SimpleNamespace(
         route_ids=None,
+        decode_inputs=None,
         enable_rl=True,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -354,7 +364,7 @@ def test_sampled_stop_controls_emission_and_records_selected_scores(
             },
         )
     )
-    runner.post_decode(result, None, None, requests)
+    runner.post_decode(result, DECODE_STEP, None, requests)
     token_ids = runner.resolve_host_token_ids(result).tolist()
     assert token_ids == [8, 9]
     runner.post_process_outputs(
@@ -378,8 +388,10 @@ def test_sampled_stop_can_serve_without_rollout_trace(monkeypatch, carrier):
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     runner.model = SimpleNamespace(
         route_ids=None,
+        decode_inputs=None,
         enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -402,10 +414,9 @@ def test_sampled_stop_can_serve_without_rollout_trace(monkeypatch, carrier):
             customized_info={"audio_codes": torch.tensor([[1, 2], [3, 4]])},
         )
     )
-    runner.post_decode(result, None, None, requests)
+    runner.post_decode(result, DECODE_STEP, None, requests)
     token_ids = runner.resolve_host_token_ids(result).tolist()
     assert token_ids == [8, 9]
-    assert "sampled_stop_logprobs" not in result.logits_output.customized_info
     runner.post_process_outputs(
         result,
         SimpleNamespace(requests=requests),
@@ -415,7 +426,10 @@ def test_sampled_stop_can_serve_without_rollout_trace(monkeypatch, carrier):
         },
     )
     assert [len(request.data.output_codes) for request in requests] == [1, 0]
-    assert all(not request.data.stop_actions for request in requests)
+    assert all(
+        not request.data.stop_actions and not request.data.stop_logprobs
+        for request in requests
+    )
 
 
 @pytest.mark.parametrize("mode", [False, True])
@@ -439,14 +453,16 @@ def run_stop_batch(
     seeds: list[int],
     positions: list[int],
     enable_rl: bool,
-) -> tuple[torch.Tensor, list[PrismRequestData], dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, list[PrismRequestData]]:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     runner.model = SimpleNamespace(
         route_ids=None,
+        decode_inputs=None,
         enable_rl=enable_rl,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -478,7 +494,7 @@ def run_stop_batch(
             },
         )
     )
-    runner.post_decode(result, None, None, requests)
+    runner.post_decode(result, DECODE_STEP, None, requests)
     tokens = runner.resolve_host_token_ids(result).clone()
     runner.post_process_outputs(
         result,
@@ -488,11 +504,7 @@ def run_stop_batch(
             for index, token in enumerate(tokens)
         },
     )
-    return (
-        tokens.eq(9).long(),
-        [request.data for request in requests],
-        result.logits_output.customized_info,
-    )
+    return tokens.eq(9).long(), [request.data for request in requests]
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -505,30 +517,29 @@ def test_real_stop_sampling_is_independent_of_batch_order_and_rl_recording(
         [[0.1, 0.7], [4.0, 0.0], [-0.4, 0.3], [0.0, 2.0]], device=device
     )
     modes, seeds, positions = [True, False, True, True], [3, 17, 42, 913], [0, 2, 11, 1]
-    actions, states, scores = run_stop_batch(logits, modes, seeds, positions, True)
-    ordinary, _, ordinary_scores = run_stop_batch(
-        logits, modes, seeds, positions, False
-    )
+    actions, states = run_stop_batch(logits, modes, seeds, positions, True)
+    ordinary, ordinary_states = run_stop_batch(logits, modes, seeds, positions, False)
     torch.testing.assert_close(actions, ordinary, rtol=0, atol=0)
-    assert "sampled_stop_logprobs" not in ordinary_scores
+    assert all(not state.stop_logprobs for state in ordinary_states)
     assert actions[1] == int(logits[1].softmax(-1)[1] > 0.1)
     assert not states[1].stop_actions and not states[1].stop_logprobs
-    assert scores["sampled_stop_logprobs"].shape == (3,)
+    assert [len(state.stop_logprobs) for state in states] == [1, 0, 1, 1]
     expected = (
         logits[[0, 2, 3]]
         .log_softmax(-1)
         .gather(1, actions[[0, 2, 3]].to(device)[:, None])
         .squeeze(1)
+        .cpu()
     )
     actual = torch.stack([states[index].stop_logprobs[0] for index in (0, 2, 3)])
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
     for index in (0, 2, 3):
-        singleton, _, _ = run_stop_batch(
+        singleton, _ = run_stop_batch(
             logits[index : index + 1], [True], [seeds[index]], [positions[index]], True
         )
         assert singleton[0] == actions[index]
     order = [3, 1, 0, 2]
-    reordered, _, _ = run_stop_batch(
+    reordered, _ = run_stop_batch(
         logits[order],
         [modes[index] for index in order],
         [seeds[index] for index in order],
@@ -536,8 +547,7 @@ def test_real_stop_sampling_is_independent_of_batch_order_and_rl_recording(
         True,
     )
     torch.testing.assert_close(reordered, actions[order], rtol=0, atol=0)
-    scores["sampled_stop_actions"].fill_(7)
-    scores["sampled_stop_logprobs"].fill_(float("nan"))
+    logits.fill_(float("nan"))
     torch.testing.assert_close(
         torch.stack([states[index].stop_logprobs[0] for index in (0, 2, 3)]), expected
     )
@@ -582,7 +592,9 @@ def test_rl_decode_graph_reads_live_temperature_and_seed():
     config = SimpleNamespace(
         n_vq=2, text_pad_idx=0, prism_input_rvq_channels=(1,), speech_vocab_size=16
     )
-    buffers = PrismDecodeInputs(config, 4, torch.device("cuda"), enable_rl=True)
+    buffers = PrismDecodeInputs(
+        config, 4, torch.device("cuda"), request_slots=4, enable_rl=True
+    )
     model = MossTTSPrismSGLangModel.__new__(MossTTSPrismSGLangModel)
     nn.Module.__init__(model)
     model.topology = SimpleNamespace(
@@ -797,9 +809,11 @@ def test_routes_follow_each_request_through_prefill_and_decode(carrier):
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     route_ids = torch.zeros(8, 2, 3, dtype=torch.uint8)
     runner.model = SimpleNamespace(
         route_ids=route_ids,
+        decode_inputs=None,
         enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -823,6 +837,15 @@ def test_routes_follow_each_request_through_prefill_and_decode(carrier):
             extend_seq_lens_cpu=prefill_lengths,
         )
         runner.post_decode(result, forward_batch, None, requests)
+        token_ids = runner.resolve_host_token_ids(result).tolist()
+        runner.post_process_outputs(
+            result,
+            SimpleNamespace(requests=requests),
+            {
+                str(i): RequestOutput(request_id=str(i), data=token)
+                for i, token in enumerate(token_ids)
+            },
+        )
 
     forward([1, 2, 3, 4, 5], [3, 2])
     forward([6, 7], [])
@@ -834,3 +857,229 @@ def test_routes_follow_each_request_through_prefill_and_decode(carrier):
     assert [
         torch.cat(request.data.routed_experts)[:, 1, 2].tolist() for request in requests
     ] == [[10, 11, 12, 13], [14]]
+
+
+def rl_runner(model: SimpleNamespace) -> MossTTSPrismModelRunner:
+    runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
+    runner._token_id_host_bufs = None
+    runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
+    runner.model = model
+    return runner
+
+
+def live_request(request_id: str, carrier, *, finished: bool = False):
+    return SchedulerRequest(
+        request_id=request_id,
+        data=PrismRequestData(
+            prompt=carrier,
+            req=SimpleNamespace(finished=lambda: finished, is_retracted=False),
+        ),
+    )
+
+
+def finish_step(runner, result, requests) -> None:
+    token_ids = runner.resolve_host_token_ids(result).tolist()
+    runner.post_process_outputs(
+        result,
+        SimpleNamespace(requests=requests),
+        {
+            request.request_id: RequestOutput(request_id=request.request_id, data=token)
+            for request, token in zip(requests, token_ids, strict=True)
+        },
+    )
+
+
+def test_lagged_resolve_drops_the_frame_after_a_finish(carrier):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    route_ids = torch.arange(2, dtype=torch.uint8)[:, None, None].repeat(1, 2, 3)
+    runner = rl_runner(
+        SimpleNamespace(
+            route_ids=route_ids,
+            decode_inputs=None,
+            enable_rl=True,
+            config=SimpleNamespace(
+                audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
+            ),
+        )
+    )
+    requests = [
+        live_request("0", carrier),
+        live_request("1", carrier, finished=True),
+    ]
+    result = SimpleNamespace(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=torch.tensor([[4.0, 0.0], [4.0, 0.0]]),
+            customized_info={
+                "audio_codes": torch.tensor([[1, 2], [3, 4]]),
+                "code_logprobs": torch.full((2, 2), -0.5),
+            },
+        )
+    )
+    record = runner.post_decode_launch(result, DECODE_STEP, requests)
+    runner.post_decode_resolve(record, result, DECODE_STEP, None, requests)
+    finish_step(runner, result, requests)
+    kept, overrun = (request.data for request in requests)
+    assert [codes.tolist() for codes in kept.output_codes] == [[1, 2]]
+    assert len(kept.code_logprobs) == len(kept.stop_probabilities) == 1
+    assert kept.routed_experts[0][:, 0, 0].tolist() == [0]
+    assert not (
+        overrun.output_codes
+        or overrun.code_logprobs
+        or overrun.stop_probabilities
+        or overrun.routed_experts
+    )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+def test_recorded_outputs_survive_later_steps_that_reuse_host_copies(carrier, device):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    runner = rl_runner(
+        SimpleNamespace(
+            route_ids=None,
+            decode_inputs=None,
+            enable_rl=True,
+            config=SimpleNamespace(
+                audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
+            ),
+        )
+    )
+    requests = [live_request("0", carrier)]
+
+    def launch(step: int) -> SimpleNamespace:
+        result = SimpleNamespace(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=torch.tensor([[4.0 + step, 0.0]], device=device),
+                customized_info={
+                    "audio_codes": torch.tensor([[step, step + 1]], device=device),
+                    "code_logprobs": torch.full((1, 2), -float(step), device=device),
+                },
+            )
+        )
+        record = runner.post_decode_launch(result, DECODE_STEP, requests)
+        runner.post_decode_resolve(record, result, DECODE_STEP, None, requests)
+        return result
+
+    # note (Linsey): Lookahead order: each step launches before the step before it resolves.
+    first = launch(1)
+    second = launch(2)
+    finish_step(runner, first, requests)
+    third = launch(3)
+    finish_step(runner, second, requests)
+    finish_step(runner, third, requests)
+    data = requests[0].data
+    assert [codes.tolist() for codes in data.output_codes] == [[1, 2], [2, 3], [3, 4]]
+    assert [scores.tolist() for scores in data.code_logprobs] == [
+        [-1.0, -1.0],
+        [-2.0, -2.0],
+        [-3.0, -3.0],
+    ]
+    assert [probability.item() for probability in data.stop_probabilities] == (
+        pytest.approx(
+            [torch.tensor([4.0 + step, 0.0]).softmax(0)[1].item() for step in (1, 2, 3)]
+        )
+    )
+
+
+def test_lookahead_needs_device_frames_and_no_penalty_history(carrier):
+    states = [PrismRequestData(prompt=carrier) for _ in range(2)]
+    for state in states:
+        state.state.generation_kwargs = {"audio_repetition_penalty": 1.0}
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(_omni_data=state) for state in states]
+    )
+    runner = rl_runner(SimpleNamespace(decode_inputs=None))
+    assert not runner.lookahead_eligible(batch)
+    runner.model = SimpleNamespace(decode_inputs=SimpleNamespace())
+    assert runner.lookahead_eligible(batch)
+    states[1].state.generation_kwargs["audio_repetition_penalty"] = 1.1
+    assert not runner.lookahead_eligible(batch)
+
+
+def test_decode_reads_frames_by_request_slot_and_samples_stops_as_the_host_does(
+    carrier,
+):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    config = SimpleNamespace(
+        text_pad_idx=0,
+        n_vq=2,
+        prism_input_rvq_channels=(1,),
+        speech_vocab_size=16,
+        audio_end_token_id=9,
+        audio_assistant_gen_slot_token_id=8,
+    )
+    buffers = PrismDecodeInputs(config, 4, torch.device("cpu"), request_slots=8)
+    runner = rl_runner(
+        SimpleNamespace(
+            route_ids=None,
+            decode_inputs=buffers,
+            enable_rl=True,
+            config=config,
+            n_vq=2,
+            device=torch.device("cpu"),
+        )
+    )
+    seeds, frames = [3, 913], [3, 7]
+    requests = []
+    for index, (seed, count) in enumerate(zip(seeds, frames, strict=True)):
+        data = PrismRequestData(
+            prompt=carrier,
+            sampling_seed=seed,
+            stop_sampling=True,
+            output_codes=[torch.zeros(2, dtype=torch.long)] * count,
+            frames_launched=count,
+        )
+        data.state.generation_kwargs = {
+            "audio_temperature": 1.0,
+            "audio_top_p": 1.0,
+            "audio_top_k": -1,
+            "audio_repetition_penalty": 1.0,
+        }
+        requests.append(SchedulerRequest(request_id=str(index), data=data))
+    buffers.last_codes[5] = torch.tensor([1, 2])
+    buffers.last_codes[2] = torch.tensor([3, 4])
+    step = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, req_pool_indices=torch.tensor([5, 2])
+    )
+    runner.prepare(requests, prefill=False, forward_batch=step)
+    assert buffers.rows[:2, 1:].tolist() == [[1, 2], [3, 4]]
+    assert buffers.positions[:2].tolist() == [6, 14]
+    assert [request.data.frames_launched for request in requests] == [4, 8]
+    logits = torch.tensor([[0.1, 0.7], [-0.4, 0.3]])
+    result = SimpleNamespace(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=logits,
+            customized_info={
+                "audio_codes": torch.tensor([[5, 6], [7, 8]]),
+                "code_logprobs": torch.zeros(2, 2),
+            },
+        )
+    )
+    runner.post_decode(result, step, None, requests)
+    assert buffers.last_codes[[5, 2]].tolist() == [[5, 6], [7, 8]]
+    actions = runner.resolve_host_token_ids(result).eq(9).long()
+    finish_step(runner, result, requests)
+    host_actions, host_states = run_stop_batch(
+        logits, [True, True], seeds, frames, True
+    )
+    torch.testing.assert_close(actions, host_actions, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.stack([request.data.stop_logprobs[0] for request in requests]),
+        torch.stack([state.stop_logprobs[0] for state in host_states]),
+        rtol=0,
+        atol=0,
+    )
