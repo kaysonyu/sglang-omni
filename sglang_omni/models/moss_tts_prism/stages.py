@@ -78,9 +78,12 @@ def create_sglang_tts_engine_executor(
     ) = None,
     total_gpu_memory_fraction: float | None = None,
     enable_rl: bool = False,
+    capture_routes: bool = False,
 ) -> OmniScheduler:
     return MossTTSPrismEngineBuilder(
-        total_gpu_memory_fraction=total_gpu_memory_fraction, enable_rl=enable_rl
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        enable_rl=enable_rl,
+        capture_routes=capture_routes,
     ).build(
         model_path,
         device=device,

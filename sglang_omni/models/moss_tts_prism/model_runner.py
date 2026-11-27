@@ -252,6 +252,21 @@ class MossTTSPrismModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         cfg = self.model.config
+        if self.model.route_ids is not None:
+            is_prefill = forward_batch.forward_mode.is_extend()
+            row_counts = (
+                list(forward_batch.extend_seq_lens_cpu)
+                if is_prefill
+                else [1] * len(requests)
+            )
+            # note (Linsey): The next forward overwrites the capture buffer, so keep a copy.
+            routes = self.model.route_ids[: sum(row_counts)].to("cpu", copy=True)
+            for request, rows in zip(requests, routes.split(row_counts), strict=True):
+                # note (Linsey): A prefill recomputes every row it holds, including re-prefilled frames.
+                if is_prefill:
+                    request.data.routed_experts = [rows]
+                else:
+                    request.data.routed_experts.append(rows)
         stop_logits = result.logits_output.next_token_logits.float()
         stop_probabilities = stop_logits.softmax(dim=-1)[:, 1]
         if self.model.enable_rl:

@@ -49,10 +49,17 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     supports_breakable_prefill_cuda_graph = True
 
     def __init__(
-        self, *, total_gpu_memory_fraction: float | None = None, enable_rl: bool = False
+        self,
+        *,
+        total_gpu_memory_fraction: float | None = None,
+        enable_rl: bool = False,
+        capture_routes: bool = False,
     ) -> None:
         super().__init__(total_gpu_memory_fraction=total_gpu_memory_fraction)
+        if capture_routes and not enable_rl:
+            raise ValueError("Prism route capture is part of the RL rollout trace")
         self.enable_rl = enable_rl
+        self.capture_routes = capture_routes
 
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | bool]:
         return {
@@ -100,6 +107,9 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         model.enable_rl = self.enable_rl
         if self.enable_rl:
             model.model_identity = prism_model_identity(checkpoint_dir)
+        if self.capture_routes:
+            # note (Linsey): No forward holds more rows than the KV pool.
+            model.enable_route_capture(model_worker.model_runner.max_total_num_tokens)
         if cfg.cuda_graph_config.prefill.backend == "breakable":
             model.model = PrismPrefillBody(model, max(cfg.cuda_graph_config.prefill.bs))
         if cfg.cuda_graph_config.decode.backend != "disabled":

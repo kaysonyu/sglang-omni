@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prism rollout actions, stop observations, and graph sampling."""
 
+import base64
 import json
 from types import SimpleNamespace
 
@@ -189,6 +190,8 @@ def request_payload(carrier):
 
 def request_model():
     return SimpleNamespace(
+        route_ids=None,
+        moe_layers=(),
         enable_rl=True,
         model_identity={"audio_vocab_size": 16, "n_vq": 2},
         config=SimpleNamespace(
@@ -270,6 +273,7 @@ def test_stop_observations_survive_reused_output_buffers(carrier, device):
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
+        route_ids=None,
         enable_rl=True,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -321,6 +325,7 @@ def test_sampled_stop_controls_emission_and_records_selected_scores(
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
+        route_ids=None,
         enable_rl=True,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -374,6 +379,7 @@ def test_sampled_stop_can_serve_without_rollout_trace(monkeypatch, carrier):
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
+        route_ids=None,
         enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -440,6 +446,7 @@ def run_stop_batch(
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
     runner.model = SimpleNamespace(
+        route_ids=None,
         enable_rl=enable_rl,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -735,3 +742,95 @@ def test_prompt_matches_artifact_typed_carrier():
         expected = processor([[message]], mode="generation")
         for name, actual in prepared.data["prism_inputs"].items():
             torch.testing.assert_close(actual, expected[name][0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("frames,finish", [(0, "stop"), (3, "stop"), (3, "length")])
+def test_trace_carries_routes_of_every_fed_row(carrier, frames, finish):
+    rows = len(carrier["input_ids"]) + frames - int(finish == "length")
+    routes = torch.randint(0, 96, (rows, 3, 8), dtype=torch.uint8)
+    trace = json.loads(
+        build_prism_rollout_trace(
+            prompt=carrier,
+            codes=torch.zeros(frames, 2, dtype=torch.long),
+            code_logprobs=torch.full((frames, 2), -2.0),
+            stop_probabilities=torch.tensor(
+                [0.02] * frames + ([0.6] if finish == "stop" else [])
+            ),
+            finish_reason=finish,
+            request_id="server-uuid",
+            admission_weight_version="step:0",
+            model_identity={"audio_vocab_size": 16},
+            sampling={"audio_temperature": 1.0},
+            routed_experts=routes,
+            moe_layers=(1, 2, 3),
+        )
+    )
+    record = trace["routed_experts"]
+    assert record["moe_layers"] == [1, 2, 3]
+    assert record["shape"] == [rows, 3, 8]
+    decoded = torch.frombuffer(
+        bytearray(base64.b64decode(record["data"])), dtype=torch.uint8
+    )
+    assert torch.equal(decoded.reshape(rows, 3, 8), routes)
+
+
+def test_trace_rejects_routes_that_miss_a_fed_row(carrier):
+    with pytest.raises(RuntimeError, match="do not cover"):
+        build_prism_rollout_trace(
+            prompt=carrier,
+            codes=torch.zeros((2, 2), dtype=torch.long),
+            code_logprobs=torch.full((2, 2), -2.0),
+            stop_probabilities=torch.tensor([0.02, 0.02, 0.6]),
+            finish_reason="stop",
+            request_id="server-uuid",
+            admission_weight_version="step:0",
+            model_identity={"audio_vocab_size": 16},
+            sampling={"audio_temperature": 1.0},
+            routed_experts=torch.zeros((3, 3, 8), dtype=torch.uint8),
+            moe_layers=(1, 2, 3),
+        )
+
+
+def test_routes_follow_each_request_through_prefill_and_decode(carrier):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
+    runner._token_id_host_bufs = None
+    runner._token_id_host_slot = 0
+    route_ids = torch.zeros(8, 2, 3, dtype=torch.uint8)
+    runner.model = SimpleNamespace(
+        route_ids=route_ids,
+        enable_rl=False,
+        config=SimpleNamespace(
+            audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
+        ),
+    )
+    requests = [
+        SchedulerRequest(request_id=str(i), data=PrismRequestData(prompt=carrier))
+        for i in range(2)
+    ]
+
+    def forward(rows, prefill_lengths):
+        route_ids[: len(rows)] = torch.tensor(rows, dtype=torch.uint8)[:, None, None]
+        result = SimpleNamespace(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=torch.tensor([[4.0, 0.0], [4.0, 0.0]]),
+                customized_info={"audio_codes": torch.zeros(2, 2, dtype=torch.long)},
+            )
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: bool(prefill_lengths)),
+            extend_seq_lens_cpu=prefill_lengths,
+        )
+        runner.post_decode(result, forward_batch, None, requests)
+
+    forward([1, 2, 3, 4, 5], [3, 2])
+    forward([6, 7], [])
+    forward([8, 9], [])
+    assert [
+        torch.cat(request.data.routed_experts)[:, 0, 0].tolist() for request in requests
+    ] == [[1, 2, 3, 6, 8], [4, 5, 7, 9]]
+    forward([10, 11, 12, 13, 14], [4, 1])
+    assert [
+        torch.cat(request.data.routed_experts)[:, 1, 2].tolist() for request in requests
+    ] == [[10, 11, 12, 13], [14]]
