@@ -78,3 +78,29 @@ memory saving, so select `--tts_engine.engine.cuda_graph_backend_prefill disable
 for eager prefill. Its separate vocoder uses eager execution when memory saving is enabled; explicitly
 enabling vocoder CUDA graphs with memory saving is rejected. Its reference encoder
 and vocoder weights are backed up to CPU during offload.
+
+A Prism routed-expert (MoE) checkpoint serves through the same pipeline. For
+rollout routing replay set `capture_routes: true` next to `enable_rl: true`: the RL
+trace then carries each fed row's expert ids (`routed_experts`, uint8
+`[rows, MoE layers, top-k]`). Two tts_engine factory options shorten a colocated
+rollout, and both are off by default:
+
+- `enable_async_decode: true` launches each decode step before the host collects
+  the step before it. Batches with an audio repetition penalty stay synchronous.
+- `prefill_coalesce_requests` and `prefill_coalesce_wait_ms` hold a prefill while
+  decode runs until that many requests wait or the oldest has waited that long.
+  Eager prefills cost about the same at any size, so refilling freed slots
+  together stalls decode less often.
+
+```yaml
+enable_rl: true
+capture_routes: true
+stages:
+  tts_engine:
+    factory:
+      enable_async_decode: true
+      prefill_coalesce_requests: 4
+      prefill_coalesce_wait_ms: 100
+    engine:
+      cuda_graph_backend_prefill: disabled
+```
