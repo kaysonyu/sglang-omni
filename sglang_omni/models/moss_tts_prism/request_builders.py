@@ -75,6 +75,7 @@ class PrismRequestData(ARRequestData):
     state: MossTTSLocalState = field(default_factory=MossTTSLocalState)
     prompt: dict[str, torch.Tensor] = field(default_factory=dict)
     output_codes: list[torch.Tensor] = field(default_factory=list)
+    frames_launched: int = 0
     sampling_seed: int = field(default_factory=new_moss_tts_sampling_seed)
     stop_sampling: bool = False
     engine_start_s: float = 0.0
@@ -85,6 +86,8 @@ class PrismRequestData(ARRequestData):
     stop_probabilities: list[torch.Tensor] = field(default_factory=list)
     stop_actions: list[torch.Tensor] = field(default_factory=list)
     stop_logprobs: list[torch.Tensor] = field(default_factory=list)
+    routed_experts: list[torch.Tensor] = field(default_factory=list)
+    moe_layers: tuple[int, ...] = ()
     admission_weight_version: str | None = None
     model_identity: dict[str, str | int | bool] | None = None
 
@@ -300,6 +303,7 @@ def build_prism_request(
         stop_sampling=state.generation_kwargs.get("stop_sampling", False),
         prompt=prompt,
         model_identity=model.model_identity,
+        moe_layers=model.moe_layers if model.route_ids is not None else (),
         admission_weight_version=admission_weight_version,
         sampling_seed=(
             derive_moss_tts_sampling_seed(seed)
@@ -348,6 +352,10 @@ def apply_prism_result(data: PrismRequestData) -> StagePayload:
             stop_logprobs=(
                 torch.stack(data.stop_logprobs) if data.stop_sampling else None
             ),
+            routed_experts=(
+                torch.cat(data.routed_experts) if data.moe_layers else None
+            ),
+            moe_layers=data.moe_layers,
             finish_reason=data.finish_reason,
             request_id=payload.request_id,
             admission_weight_version=data.admission_weight_version,

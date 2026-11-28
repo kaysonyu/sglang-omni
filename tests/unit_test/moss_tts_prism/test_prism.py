@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from torch import nn
 
 from sglang_omni.client.client import Client
@@ -14,6 +15,7 @@ from sglang_omni.models.moss_tts_prism.config import MossTTSPrismPipelineConfig
 from sglang_omni.models.moss_tts_prism.engine_builder import MossTTSPrismEngineBuilder
 from sglang_omni.models.moss_tts_prism.model_runner import (
     MossTTSPrismModelRunner,
+    PinnedStaging,
     prism_request_inputs,
 )
 from sglang_omni.models.moss_tts_prism.request_builders import (
@@ -27,6 +29,9 @@ from sglang_omni.models.moss_tts_prism.sglang_model import (
     MossTTSPrismSGLangModel,
     PrismBatchInputs,
     PrismDecodeInputs,
+    PrismMoEMLP,
+    PrismPrefillBody,
+    PrismTransformer,
     prism_cache_layout,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -39,6 +44,9 @@ def unit(kind, index, start, stop, heads=()):
     return SimpleNamespace(
         kind=kind, index=index, layer_start=start, layer_stop=stop, rvq_heads=heads
     )
+
+
+DECODE_STEP = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
 
 @pytest.mark.parametrize("reapply, expected", [(True, 94.0), (False, 82.0)])
@@ -111,6 +119,36 @@ def test_virtual_cache_slots_exclude_mlp_only_repetitions():
         ),
     )
     assert prism_cache_layout(config) == ((0, 0), (1, 1), (2, 1))
+
+
+def test_breakable_prefill_body_builds_its_capture_inputs():
+    owner = MossTTSPrismSGLangModel.__new__(MossTTSPrismSGLangModel)
+    nn.Module.__init__(owner)
+    owner.config = SimpleNamespace(
+        n_vq=2,
+        text_pad_idx=0,
+        prism_input_rvq_channels=(1,),
+        speech_vocab_size=4,
+        prism_mlp_only_layers=(),
+        prism_topology=SimpleNamespace(execution_units=(unit("ordinary", 0, 0, 2),)),
+    )
+    owner.n_vq = 2
+    owner.enable_rl = True
+    owner.transformer = nn.Module()
+    owner.transformer.embed_tokens = nn.Embedding(1, 2)
+    layers = []
+    for index in range(2):
+        layer = nn.Module()
+        layer.self_attn = nn.Module()
+        layer.self_attn.attn = SimpleNamespace(layer_id=index)
+        layers.append(layer)
+    owner.transformer.layers = nn.ModuleList(layers)
+
+    body = PrismPrefillBody(owner, 8)
+
+    assert len(body.layers) == 2 and body.codes.shape == (8, 2)
+    assert body.inputs is body.capture_inputs
+    assert body.capture_inputs.rows.shape == (1, 3)
 
 
 def prompt():
@@ -257,7 +295,10 @@ def test_stop_step_is_excluded_but_length_limited_frame_is_kept(frames, stop, de
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     runner.model = SimpleNamespace(
+        route_ids=None,
+        decode_inputs=None,
         enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -283,7 +324,7 @@ def test_stop_step_is_excluded_but_length_limited_frame_is_kept(frames, stop, de
                 ),
             )
         )
-        runner.post_decode(result, None, None, [request])
+        runner.post_decode(result, DECODE_STEP, None, [request])
         host_ids = runner.resolve_host_token_ids(result)
         assert host_ids.device.type == "cpu"
         output = RequestOutput(request_id="test", data=host_ids.item())
@@ -733,13 +774,19 @@ def test_unsupported_engine_modes_fail_before_loading(monkeypatch, overrides, me
         setattr(config, name, value)
     monkeypatch.setattr(engine_builder, "resolved_view", lambda args: config)
     with pytest.raises(ValueError, match=message):
-        MossTTSPrismEngineBuilder().validate_before_infrastructure(config)
+        MossTTSPrismEngineBuilder(
+            enable_async_decode=False,
+            async_decode_min_batch_size=2,
+            prefill_coalesce_requests=0,
+            prefill_coalesce_wait_ms=60.0,
+        ).validate_before_infrastructure(config)
 
 
 def test_sampling_tracks_request_seed_and_history_after_batch_reordering():
     config = SimpleNamespace(text_pad_idx=0, n_vq=2, prism_input_rvq_channels=(1,))
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner.model = SimpleNamespace(
+        route_ids=None,
         enable_rl=False,
         config=config,
         n_vq=2,
@@ -758,9 +805,9 @@ def test_sampling_tracks_request_seed_and_history_after_batch_reordering():
         }
         requests.append(SchedulerRequest(request_id=str(index), data=data))
     logits = torch.tensor([[1.0, -1.0, 2.0, 3.0, 4.0], [2.0, 1.0, 3.0, -2.0, 0.0]])
-    runner.prepare(requests, prefill=False)
+    runner.prepare(requests, prefill=False, forward_batch=DECODE_STEP)
     first = runner.model.batch_inputs.sample(logits.clone(), 0)
-    runner.prepare(requests[::-1], prefill=False)
+    runner.prepare(requests[::-1], prefill=False, forward_batch=DECODE_STEP)
     second = runner.model.batch_inputs.sample(logits.flip(0).clone(), 0)
     torch.testing.assert_close(first, second.flip(0))
 
@@ -772,14 +819,21 @@ def test_decode_graph_refreshes_seed_history_and_batch_rows():
         text_pad_idx=0, n_vq=2, prism_input_rvq_channels=(1,), speech_vocab_size=1024
     )
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
-    buffers = PrismDecodeInputs(config, 4, device)
+    buffers = PrismDecodeInputs(config, 4, device, request_slots=8)
     runner.model = SimpleNamespace(
-        enable_rl=False, config=config, n_vq=2, device=device, decode_inputs=buffers
+        route_ids=None,
+        enable_rl=False,
+        config=config,
+        n_vq=2,
+        device=device,
+        decode_inputs=buffers,
     )
     requests = []
     for index in range(3):
         data = PrismRequestData(prompt=prompt(), sampling_seed=42 + index)
         data.output_codes = [torch.tensor([1 + index, 2 + index])]
+        data.frames_launched = len(data.output_codes)
+        buffers.last_codes[7 - 2 * index] = data.output_codes[-1]
         data.state.generation_kwargs = {
             "audio_temperature": (1.7, 0.0, 0.8)[index],
             "audio_top_p": (0.8, 1.0, 0.9)[index],
@@ -801,12 +855,22 @@ def test_decode_graph_refreshes_seed_history_and_batch_rows():
         sampled = inputs.sample(logits, 0)
         captured_rows = inputs.rows.clone()
 
+    # note (Linsey): Slots are out of batch order, as the request pool hands them out.
+    slots = {
+        request.request_id: 7 - 2 * index for index, request in enumerate(requests)
+    }
     for active in (requests, requests[::-1], requests[1:2]):
+        step = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.tensor(
+                [slots[request.request_id] for request in active], device=device
+            ),
+        )
         runner.model.decode_inputs = None
-        runner.prepare(active, prefill=False)
+        runner.prepare(active, prefill=False, forward_batch=step)
         expected = runner.model.batch_inputs.sample(logits[: len(active)].clone(), 0)
         runner.model.decode_inputs = buffers
-        runner.prepare(active, prefill=False)
+        runner.prepare(active, prefill=False, forward_batch=step)
         graph.replay()
         torch.testing.assert_close(sampled[: len(active)], expected, rtol=0, atol=0)
         assert captured_rows[: len(active), 0].tolist() == [config.text_pad_idx] * len(
@@ -816,8 +880,14 @@ def test_decode_graph_refreshes_seed_history_and_batch_rows():
             captured_rows[: len(active), 1:].cpu(),
             torch.stack([request.data.output_codes[-1] for request in active]),
         )
+        assert [request.data.frames_launched for request in active] == [
+            len(request.data.output_codes) + 1 for request in active
+        ]
         for request in active:
             request.data.output_codes.append(torch.tensor([3, 4]))
+            buffers.last_codes[slots[request.request_id]] = request.data.output_codes[
+                -1
+            ]
             request.data.sampling_seed += 7
             request.data.state.generation_kwargs["audio_repetition_penalty"] = 1.0
 
@@ -947,7 +1017,13 @@ def test_prefill_graph_replays_live_requests(monkeypatch):
     model_path = os.environ.get("MOSS_TTS_PRISM_TEST_MODEL")
     if not model_path or not torch.cuda.is_available():
         pytest.skip("CUDA and MOSS_TTS_PRISM_TEST_MODEL are required")
-    scheduler = MossTTSPrismEngineBuilder(enable_rl=True).build(
+    scheduler = MossTTSPrismEngineBuilder(
+        enable_rl=True,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+        prefill_coalesce_requests=0,
+        prefill_coalesce_wait_ms=60.0,
+    ).build(
         model_path,
         device="cuda",
         gpu_id=0,
@@ -1120,7 +1196,10 @@ def test_stop_probability_threshold_and_mixed_batch(monkeypatch, device):
     runner = MossTTSPrismModelRunner.__new__(MossTTSPrismModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.staging = PinnedStaging()
     runner.model = SimpleNamespace(
+        route_ids=None,
+        decode_inputs=None,
         enable_rl=False,
         config=SimpleNamespace(
             audio_end_token_id=9, audio_assistant_gen_slot_token_id=8
@@ -1138,7 +1217,7 @@ def test_stop_probability_threshold_and_mixed_batch(monkeypatch, device):
     requests = [
         SchedulerRequest(request_id=str(i), data=PrismRequestData()) for i in range(3)
     ]
-    runner.post_decode(result, None, None, requests)
+    runner.post_decode(result, DECODE_STEP, None, requests)
     ids = runner.resolve_host_token_ids(result).tolist()
     assert ids == [8, 9, 9]
     outputs = {
@@ -1150,5 +1229,105 @@ def test_stop_probability_threshold_and_mixed_batch(monkeypatch, device):
     monkeypatch.setattr(
         model_runner, "PRISM_STOP_THRESHOLD", logits.float().softmax(-1)[1, 1].item()
     )
-    runner.post_decode(result, None, None, requests)
+    runner.post_decode(result, DECODE_STEP, None, requests)
     assert runner.resolve_host_token_ids(result).tolist() == [8, 8, 9]
+
+
+class RecordingExperts(nn.Module):
+    def __init__(self, experts, hidden, width):
+        super().__init__()
+        self.w13_weight = nn.Parameter(torch.zeros(experts, 2 * width, hidden))
+        self.w2_weight = nn.Parameter(torch.zeros(experts, hidden, width))
+        self.routes = None
+
+    def forward(self, hidden, routes):
+        self.routes = routes
+        return torch.zeros_like(hidden)
+
+
+def moe_mlp(experts=4, hidden=3, width=2, top_k=2):
+    mlp = PrismMoEMLP.__new__(PrismMoEMLP)
+    nn.Module.__init__(mlp)
+    mlp.top_k = top_k
+    mlp.gate = nn.Parameter(torch.zeros(experts, hidden), requires_grad=False)
+    mlp.experts = RecordingExperts(experts, hidden, width)
+    mlp.route_ids = None
+    return mlp
+
+
+def test_moe_router_is_fp32_softmax_over_top_k_logits_and_captures_ids():
+    mlp = moe_mlp()
+    mlp.gate.data.copy_(
+        torch.tensor([[1.0, 0, 0], [0, 2.0, 0], [0, 0, 3.0], [0.5, 0.5, 0.5]])
+    )
+    mlp.route_ids = torch.zeros(4, 2, dtype=torch.uint8)
+    hidden = torch.tensor([[1.0, 1.0, 1.0], [2.0, 0.0, 0.0]], dtype=torch.bfloat16)
+    mlp(hidden, SimpleNamespace())
+    routes = mlp.experts.routes
+    logits = hidden.float() @ mlp.gate.T
+    expected_scores, expected_ids = logits.topk(2, dim=-1)
+    assert routes.topk_ids.dtype == torch.int32
+    assert routes.topk_ids.tolist() == expected_ids.tolist() == [[2, 1], [0, 3]]
+    torch.testing.assert_close(routes.topk_weights, expected_scores.softmax(-1))
+    assert routes.topk_weights.dtype == torch.float32
+    assert mlp.route_ids[:2].tolist() == [[2, 1], [0, 3]]
+    assert not mlp.route_ids[2:].any()
+
+
+def test_moe_weights_load_stacked_and_per_expert_in_place():
+    model = MossTTSPrismSGLangModel.__new__(MossTTSPrismSGLangModel)
+    nn.Module.__init__(model)
+    model.transformer = nn.Module()
+    layer = nn.Module()
+    layer.mlp = moe_mlp()
+    model.transformer.layers = nn.ModuleList([layer])
+    experts = layer.mlp.experts
+    pointers = (
+        experts.w13_weight.data_ptr(),
+        experts.w2_weight.data_ptr(),
+        layer.mlp.gate.data_ptr(),
+    )
+    gate_up = torch.randn(4, 4, 3)
+    model.load_weights(
+        [
+            (
+                "transformer.layers.0.mlp.gate.weight",
+                torch.ones(4, 3, dtype=torch.bfloat16),
+            ),
+            ("transformer.layers.0.mlp.experts.gate_up_proj", gate_up),
+            ("transformer.layers.0.mlp.experts.down_proj", torch.ones(4, 3, 2)),
+        ]
+    )
+    model.load_weights(
+        [("transformer.layers.0.mlp.experts.down_proj.2", torch.full((3, 2), 5.0))]
+    )
+    assert pointers == (
+        experts.w13_weight.data_ptr(),
+        experts.w2_weight.data_ptr(),
+        layer.mlp.gate.data_ptr(),
+    )
+    assert layer.mlp.gate.dtype == torch.float32 and bool((layer.mlp.gate == 1).all())
+    torch.testing.assert_close(experts.w13_weight.data, gate_up)
+    assert experts.w2_weight[:, 0, 0].tolist() == [1.0, 1.0, 5.0, 1.0]
+    with pytest.raises(ValueError, match="has shape"):
+        model.load_weights(
+            [("transformer.layers.0.mlp.experts.gate_up_proj", torch.ones(4, 3))]
+        )
+
+
+def test_moe_layers_must_run_once_per_forward():
+    config = SimpleNamespace(
+        language_config=SimpleNamespace(vocab_size=4, hidden_size=2),
+        prism_moe_layers=[1],
+        prism_mlp_only_layers=(),
+        prism_topology=SimpleNamespace(
+            num_layers=2,
+            execution_units=(
+                unit("ordinary", 0, 0, 1),
+                unit("loop", 1, 1, 2),
+                unit("loop", 1, 1, 2),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="applied once per forward"):
+        PrismTransformer(config)

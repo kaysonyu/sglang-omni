@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import copy
+import re
 import weakref
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
@@ -13,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -74,6 +78,7 @@ class PrismDecodeInputs:
         capacity: int,
         device: torch.device,
         *,
+        request_slots: int,
         enable_rl: bool = False,
     ) -> None:
         self.enable_rl = enable_rl
@@ -81,6 +86,11 @@ class PrismDecodeInputs:
             capacity, config.n_vq + 1, dtype=torch.long, device=device
         )
         self.rows[:, 0] = config.text_pad_idx
+        # note (Linsey): Each request's last frame stays on the device by request pool slot, so a
+        # lookahead step reads its input without waiting for the host results of the step before it.
+        self.last_codes = torch.zeros(
+            request_slots, config.n_vq, dtype=torch.long, device=device
+        )
         self.item_kind = torch.ones(capacity, dtype=torch.long, device=device)
         self.audio_role = torch.full((capacity,), 2, dtype=torch.long, device=device)
         self.retention = torch.zeros(
@@ -97,19 +107,23 @@ class PrismDecodeInputs:
         self.sampling_ints = torch.zeros(3, capacity, dtype=torch.long, device=device)
         self.top_k, self.seeds, self.positions = self.sampling_ints.unbind()
         self.top_k.fill_(1)
-        # note (Zhang Yiyang): Synchronous decode consumes the previous frame
-        # before reusing these pinned inputs.
-        self.rows_cpu = torch.zeros_like(
-            self.rows, device="cpu", pin_memory=device.type == "cuda"
+        # note (Linsey): Two pinned copies, because a lookahead launch fills one while the copy
+        # queued by the step before it may still read the other.
+        self.floats_cpu = tuple(
+            torch.ones_like(
+                self.sampling_floats, device="cpu", pin_memory=device.type == "cuda"
+            )
+            for _ in range(2)
         )
-        self.rows_cpu[:, 0] = config.text_pad_idx
-        self.floats_cpu = torch.ones_like(
-            self.sampling_floats, device="cpu", pin_memory=device.type == "cuda"
+        self.ints_cpu = tuple(
+            torch.zeros_like(
+                self.sampling_ints, device="cpu", pin_memory=device.type == "cuda"
+            )
+            for _ in range(2)
         )
-        self.ints_cpu = torch.zeros_like(
-            self.sampling_ints, device="cpu", pin_memory=device.type == "cuda"
-        )
-        self.ints_cpu[0].fill_(1)
+        for ints in self.ints_cpu:
+            ints[0].fill_(1)
+        self.host_slot = 0
         self.history = torch.zeros(
             capacity,
             config.n_vq,
@@ -162,18 +176,76 @@ class PrismDecodeInputs:
         )
 
 
+MOE_EXPERT_WEIGHT = re.compile(
+    r"(transformer\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)(?:\.(\d+))?$"
+)
+
+
+def prism_moe_layers(config: PretrainedConfig) -> tuple[int, ...]:
+    """Physical layers whose MLP is routed; empty for a dense checkpoint."""
+    return tuple(getattr(config, "prism_moe_layers", None) or ())
+
+
+class PrismMoEMLP(nn.Module):
+    """Routed SwiGLU experts behind an FP32 router: softmax over the top-k logits."""
+
+    def __init__(self, config: PretrainedConfig, *, layer_id: int) -> None:
+        super().__init__()
+        if config.prism_moe_shared_expert_intermediate_size:
+            raise ValueError("MOSS-TTS Prism serving has no shared-expert MoE yet")
+        hidden_size = config.language_config.hidden_size
+        self.top_k = config.prism_moe_router_topk
+        # note (Linsey): The router stays FP32 like the trainer's; weight loads refresh it from bf16.
+        self.gate = nn.Parameter(
+            torch.empty(config.prism_moe_num_experts, hidden_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.experts = FusedMoE(
+            num_experts=config.prism_moe_num_experts,
+            top_k=self.top_k,
+            hidden_size=hidden_size,
+            intermediate_size=config.prism_moe_ffn_hidden_size,
+            layer_id=layer_id,
+            reduce_results=False,
+        )
+        self.route_ids: torch.Tensor | None = None
+
+    def forward(
+        self, hidden: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            logits = F.linear(hidden.float(), self.gate)
+        scores, expert_ids = torch.topk(logits, self.top_k, dim=-1)
+        if self.route_ids is not None:
+            self.route_ids[: expert_ids.shape[0]].copy_(expert_ids)
+        routes = StandardTopKOutput(
+            topk_weights=scores.softmax(dim=-1),
+            topk_ids=expert_ids.to(torch.int32),
+            router_logits=logits,
+        )
+        return self.experts(hidden, routes)
+
+
 class PrismDecoderLayer(nn.Module):
     def __init__(
-        self, config: PretrainedConfig, *, layer_id: int, mlp_only: bool
+        self,
+        config: PretrainedConfig,
+        *,
+        layer_id: int,
+        mlp_only: bool,
+        moe_config: PretrainedConfig | None = None,
     ) -> None:
         super().__init__()
         self.mlp_only = mlp_only
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = Qwen3MLP(
-            config.hidden_size, config.intermediate_size, config.hidden_act
-        )
+        if moe_config is not None:
+            self.mlp = PrismMoEMLP(moe_config, layer_id=layer_id)
+        else:
+            self.mlp = Qwen3MLP(
+                config.hidden_size, config.intermediate_size, config.hidden_act
+            )
         if not mlp_only:
             self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.self_attn = Qwen3Attention(
@@ -206,12 +278,27 @@ class PrismTransformer(nn.Module):
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
         language = config.language_config
+        moe_layers = prism_moe_layers(config)
+        applications = Counter(
+            index
+            for unit in config.prism_topology.execution_units
+            for index in range(unit.layer_start, unit.layer_stop)
+        )
+        if any(
+            index in config.prism_mlp_only_layers or applications[index] != 1
+            for index in moe_layers
+        ):
+            # note (Linsey): Captured routes assume one invocation of each MoE layer per forward.
+            raise ValueError(
+                "Prism MoE layers must be attention layers applied once per forward"
+            )
         self.embed_tokens = nn.Embedding(language.vocab_size, language.hidden_size)
         self.layers = nn.ModuleList(
             PrismDecoderLayer(
                 language,
                 layer_id=index,
                 mlp_only=index in config.prism_mlp_only_layers,
+                moe_config=config if index in moe_layers else None,
             )
             for index in range(config.prism_topology.num_layers)
         )
@@ -222,6 +309,8 @@ class MossTTSPrismSGLangModel(nn.Module):
     enable_action_scoring: bool = False
     teacher_weight_version: str | None = None
     model_identity: dict[str, str | int | bool] | None = None
+    moe_layers: tuple[int, ...] = ()
+    route_ids: torch.Tensor | None = None
 
     def rollout_model_info(
         self,
@@ -234,6 +323,8 @@ class MossTTSPrismSGLangModel(nn.Module):
             "stop_semantics": "pre_frame_threshold_v1",
             "supports_action_scoring": is_teacher,
             "supports_weight_update": not is_teacher,
+            "moe_layers": list(self.moe_layers),
+            "captures_routed_experts": self.route_ids is not None,
             **(
                 {
                     "weight_version": self.teacher_weight_version,
@@ -280,6 +371,21 @@ class MossTTSPrismSGLangModel(nn.Module):
         self.batch_inputs: PrismBatchInputs | None = None
         self.decode_inputs: PrismDecodeInputs | None = None
         self.model: PrismPrefillBody | None = None
+        self.moe_layers = prism_moe_layers(config)
+
+    def enable_route_capture(self, capacity: int) -> None:
+        """Keep each MoE layer's expert ids for the rows of the latest forward."""
+        if not self.moe_layers:
+            raise ValueError("Route capture requires a MoE Prism checkpoint")
+        self.route_ids = torch.zeros(
+            capacity,
+            len(self.moe_layers),
+            self.config.prism_moe_router_topk,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        for column, index in enumerate(self.moe_layers):
+            self.transformer.layers[index].mlp.route_ids = self.route_ids[:, column]
 
     @property
     def device(self) -> torch.device:
@@ -507,15 +613,34 @@ class MossTTSPrismSGLangModel(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         )
         for name, weight in weights:
-            for target, source, shard in stacked:
-                if f".{source}." in name:
-                    param = params[name.replace(f".{source}.", f".{target}.")]
-                    param.weight_loader(param, weight, shard)
-                    break
+            expert = MOE_EXPERT_WEIGHT.match(name)
+            if expert is not None or name.endswith(".mlp.gate.weight"):
+                if expert is None:
+                    destination = params[name.removesuffix(".weight")].data
+                else:
+                    prefix, projection, index = expert.groups()
+                    stacked_name = (
+                        "w13_weight" if projection == "gate_up_proj" else "w2_weight"
+                    )
+                    destination = params[f"{prefix}.{stacked_name}"].data
+                    if index is not None:
+                        destination = destination[int(index)]
+                if destination.shape != weight.shape:
+                    raise ValueError(
+                        f"{name} has shape {tuple(weight.shape)}, expected {tuple(destination.shape)}"
+                    )
+                # note (Linsey): In-place copies keep the pointers captured CUDA graphs read.
+                destination.copy_(weight)
             else:
-                param = params[name]
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, weight)
+                for target, source, shard in stacked:
+                    if f".{source}." in name:
+                        param = params[name.replace(f".{source}.", f".{target}.")]
+                        param.weight_loader(param, weight, shard)
+                        break
+                else:
+                    param = params[name]
+                    loader = getattr(param, "weight_loader", default_weight_loader)
+                    loader(param, weight)
 
 
 class PrismAttentionSlot(nn.Module):
@@ -544,8 +669,9 @@ class PrismPrefillBody(nn.Module):
             torch.zeros(capacity, dtype=torch.bool, device=owner.device),
             persistent=False,
         )
+        # note (Linsey): Capture inputs never decode a request, so one request slot is enough.
         self.capture_inputs = PrismDecodeInputs(
-            owner.config, 1, owner.device, enable_rl=owner.enable_rl
+            owner.config, 1, owner.device, request_slots=1, enable_rl=owner.enable_rl
         ).for_batch(1)
         self.inputs = self.capture_inputs
         self.mask[0] = True

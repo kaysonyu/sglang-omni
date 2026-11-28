@@ -73,8 +73,43 @@ A colocated iteration is:
 5. Commit the new weight version and restore KV and graph memory.
 6. Generate the next rollout.
 
-Prism keeps its AR decode graphs. SGLang's breakable prefill backend rejects
-memory saving, so select `--tts_engine.engine.cuda_graph_backend_prefill disabled`
-for eager prefill. Its separate vocoder uses eager execution when memory saving is enabled; explicitly
+Prism keeps its AR decode graphs. SGLang refuses breakable prefill graphs when
+the memory saver releases graph memory (`SGLANG_MEMORY_SAVER_CUDA_GRAPH`, which
+slime sets for its engines), so a pipeline with `enable_memory_saver: true`
+selects `--tts_engine.engine.cuda_graph_backend_prefill disabled` for eager
+prefill. A colocated job that keeps rollout resident (slime's
+`--no-offload-rollout`) starts the pipeline without the memory saver and can keep
+breakable prefill graphs, whose memory then stays allocated during training.
+Its separate vocoder uses eager execution when memory saving is enabled; explicitly
 enabling vocoder CUDA graphs with memory saving is rejected. Its reference encoder
 and vocoder weights are backed up to CPU during offload.
+
+A Prism routed-expert (MoE) checkpoint serves through the same pipeline. For
+rollout routing replay set `capture_routes: true` next to `enable_rl: true`: the RL
+trace then carries each fed row's expert ids (`routed_experts`, uint8
+`[rows, MoE layers, top-k]`). Two tts_engine factory options shorten a colocated
+rollout, and both are off by default:
+
+- `enable_async_decode: true` launches each decode step before the host collects
+  the step before it. Batches with an audio repetition penalty stay synchronous.
+  The collected step reports its next tokens from the runner's pinned host copy,
+  so no device read waits behind the step already launched.
+- `prefill_coalesce_requests` and `prefill_coalesce_wait_ms` hold a prefill while
+  decode runs until that many requests wait or the oldest has waited that long.
+  Eager prefills cost about the same at any size, so refilling freed slots
+  together stalls decode less often.
+
+```yaml
+enable_rl: true
+capture_routes: true
+stages:
+  tts_engine:
+    factory:
+      enable_async_decode: true
+      prefill_coalesce_requests: 4
+      prefill_coalesce_wait_ms: 100
+    engine:
+      # Rollout resident (no memory saver); select disabled with enable_memory_saver.
+      cuda_graph_backend_prefill: breakable
+      cuda_graph_bs_prefill: [64, 128, 256, 384, 512, 768, 1024, 1536, 2048]
+```

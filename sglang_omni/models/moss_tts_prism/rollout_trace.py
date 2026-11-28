@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -51,6 +52,8 @@ def build_prism_rollout_trace(
     sampling: dict[str, float | int | bool],
     stop_actions: torch.Tensor | None = None,
     stop_logprobs: torch.Tensor | None = None,
+    routed_experts: torch.Tensor | None = None,
+    moe_layers: tuple[int, ...] = (),
 ) -> bytes:
     codes = codes.long().cpu()
     code_logprobs = code_logprobs.float().cpu()
@@ -178,5 +181,21 @@ def build_prism_rollout_trace(
         "finish_reason": finish_reason,
         "total_action_count": frames * channels + (stop_count if sampled_stop else 0),
     }
+    if routed_experts is not None:
+        # note (Linsey): A truncated trajectory never feeds its last frame, so that row has no route.
+        rows = len(prompt["input_ids"]) + frames - int(finish_reason == "length")
+        if routed_experts.dtype != torch.uint8 or routed_experts.shape[:2] != (
+            rows,
+            len(moe_layers),
+        ):
+            raise RuntimeError("Prism captured routes do not cover the fed rows")
+        trace["routed_experts"] = {
+            "layout": "fed_rows_moe_layers_topk_uint8",
+            "moe_layers": list(moe_layers),
+            "shape": list(routed_experts.shape),
+            "data": base64.b64encode(
+                routed_experts.contiguous().numpy().tobytes()
+            ).decode(),
+        }
     # note (Zhang Yiyang): Avoid routing every scalar of a long rollout separately.
     return json.dumps(trace, separators=(",", ":"), allow_nan=False).encode()

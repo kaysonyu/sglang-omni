@@ -49,10 +49,25 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     supports_breakable_prefill_cuda_graph = True
 
     def __init__(
-        self, *, total_gpu_memory_fraction: float | None = None, enable_rl: bool = False
+        self,
+        *,
+        total_gpu_memory_fraction: float | None = None,
+        enable_rl: bool = False,
+        capture_routes: bool = False,
+        enable_async_decode: bool,
+        async_decode_min_batch_size: int,
+        prefill_coalesce_requests: int,
+        prefill_coalesce_wait_ms: float,
     ) -> None:
         super().__init__(total_gpu_memory_fraction=total_gpu_memory_fraction)
+        if capture_routes and not enable_rl:
+            raise ValueError("Prism route capture is part of the RL rollout trace")
         self.enable_rl = enable_rl
+        self.capture_routes = capture_routes
+        self.enable_async_decode = enable_async_decode
+        self.async_decode_min_batch_size = async_decode_min_batch_size
+        self.prefill_coalesce_requests = prefill_coalesce_requests
+        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
 
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | bool]:
         return {
@@ -100,6 +115,9 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
         model.enable_rl = self.enable_rl
         if self.enable_rl:
             model.model_identity = prism_model_identity(checkpoint_dir)
+        if self.capture_routes:
+            # note (Linsey): No forward holds more rows than the KV pool.
+            model.enable_route_capture(model_worker.model_runner.max_total_num_tokens)
         if cfg.cuda_graph_config.prefill.backend == "breakable":
             model.model = PrismPrefillBody(model, max(cfg.cuda_graph_config.prefill.bs))
         if cfg.cuda_graph_config.decode.backend != "disabled":
@@ -107,6 +125,9 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
                 model.config,
                 max(get_decode_cuda_graph_bs(server_args)),
                 model.device,
+                request_slots=model_worker.model_runner.req_to_token_pool.req_to_token.shape[
+                    0
+                ],
                 enable_rl=self.enable_rl,
             )
 
@@ -121,9 +142,14 @@ class MossTTSPrismEngineBuilder(MossTtsEngineBuilder):
     ) -> tuple[partial[PrismRequestData], PrismResultAdapter]:
         return partial(build_prism_request, model=model), apply_prism_result
 
-    def extra_scheduler_kwargs(self) -> dict[str, bool | PrismStreamOutputBuilder]:
+    def extra_scheduler_kwargs(
+        self,
+    ) -> dict[str, bool | int | float | PrismStreamOutputBuilder]:
         return {
-            "enable_async_decode": False,
+            "enable_async_decode": self.enable_async_decode,
+            "async_decode_min_batch_size": self.async_decode_min_batch_size,
+            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
             "stream_output_builder": PrismStreamOutputBuilder(),
         }
 
