@@ -247,6 +247,23 @@ def test_row_ownership_tracks_current_batch_order_across_steps() -> None:
         assert batch_result.next_token_ids.tolist() == tokens.tolist()
 
 
+def test_async_resolve_reports_the_host_token_copy() -> None:
+    host = torch.tensor([7, 8])
+    output = ModelRunnerOutput(
+        outputs={},
+        can_run_cuda_graph=True,
+        next_token_ids=torch.tensor([7, 8]),
+        host_token_ids=host,
+    )
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._model_runner = SimpleNamespace(execute_resolve=lambda pending: output)
+    scheduler.emit_stream_output = lambda sched_output, mr_output, skip_rids=(): None
+
+    result = scheduler.run_batch_resolve(None, None, object())
+
+    assert result.next_token_ids is host and result.can_run_cuda_graph
+
+
 def test_make_batch_result_requires_declared_host_token_ids() -> None:
     malformed_output = SimpleNamespace(next_token_ids=None, can_run_cuda_graph=False)
 

@@ -1604,17 +1604,14 @@ class OmniScheduler:
         live batch carries no token side channel under the upstream FutureMap
         contract.
         """
-        from sglang.srt.managers.scheduler import GenerationBatchResult
-
         mr_output = self._model_runner.execute_resolve(pending_step)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
         self.emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
-        return GenerationBatchResult(
-            logits_output=None,
-            next_token_ids=mr_output.next_token_ids,
-            can_run_cuda_graph=mr_output.can_run_cuda_graph,
-        )
+        # note (Linsey): Report the runner's pinned host copy, as the sync path does. The device
+        # tokens' .tolist() would wait on this stream behind the step launched just before this
+        # resolve, so every decode step would launch only after the previous one finished.
+        return self.make_batch_result(mr_output)
 
     def handle_batch_failure(self, batch: Any, error: Exception) -> None:
         reqs = list(batch.reqs)
