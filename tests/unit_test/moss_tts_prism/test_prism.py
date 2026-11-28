@@ -30,6 +30,7 @@ from sglang_omni.models.moss_tts_prism.sglang_model import (
     PrismBatchInputs,
     PrismDecodeInputs,
     PrismMoEMLP,
+    PrismPrefillBody,
     PrismTransformer,
     prism_cache_layout,
 )
@@ -118,6 +119,36 @@ def test_virtual_cache_slots_exclude_mlp_only_repetitions():
         ),
     )
     assert prism_cache_layout(config) == ((0, 0), (1, 1), (2, 1))
+
+
+def test_breakable_prefill_body_builds_its_capture_inputs():
+    owner = MossTTSPrismSGLangModel.__new__(MossTTSPrismSGLangModel)
+    nn.Module.__init__(owner)
+    owner.config = SimpleNamespace(
+        n_vq=2,
+        text_pad_idx=0,
+        prism_input_rvq_channels=(1,),
+        speech_vocab_size=4,
+        prism_mlp_only_layers=(),
+        prism_topology=SimpleNamespace(execution_units=(unit("ordinary", 0, 0, 2),)),
+    )
+    owner.n_vq = 2
+    owner.enable_rl = True
+    owner.transformer = nn.Module()
+    owner.transformer.embed_tokens = nn.Embedding(1, 2)
+    layers = []
+    for index in range(2):
+        layer = nn.Module()
+        layer.self_attn = nn.Module()
+        layer.self_attn.attn = SimpleNamespace(layer_id=index)
+        layers.append(layer)
+    owner.transformer.layers = nn.ModuleList(layers)
+
+    body = PrismPrefillBody(owner, 8)
+
+    assert len(body.layers) == 2 and body.codes.shape == (8, 2)
+    assert body.inputs is body.capture_inputs
+    assert body.capture_inputs.rows.shape == (1, 3)
 
 
 def prompt():

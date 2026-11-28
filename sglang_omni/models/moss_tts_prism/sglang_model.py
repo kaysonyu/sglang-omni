@@ -669,8 +669,9 @@ class PrismPrefillBody(nn.Module):
             torch.zeros(capacity, dtype=torch.bool, device=owner.device),
             persistent=False,
         )
+        # note (Linsey): Capture inputs never decode a request, so one request slot is enough.
         self.capture_inputs = PrismDecodeInputs(
-            owner.config, 1, owner.device, enable_rl=owner.enable_rl
+            owner.config, 1, owner.device, request_slots=1, enable_rl=owner.enable_rl
         ).for_batch(1)
         self.inputs = self.capture_inputs
         self.mask[0] = True
